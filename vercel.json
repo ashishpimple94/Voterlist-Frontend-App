@@ -5,11 +5,6 @@
       "destination": "https://xtend.online/Voter/$1"
     }
   ],
-  "functions": {
-    "api/whatsapp-send.js": {
-      "runtime": "nodejs18.x"
-    }
-  },
   "headers": [
     {
       "source": "/static/(.*)",
