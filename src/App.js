@@ -229,6 +229,171 @@ function App() {
   }, [searchQuery]);
 
   // Send WhatsApp message automatically (silent, no alerts) - for auto-send feature
+  // Unified helper function to get the correct API endpoint URL with fallback
+  const getWhatsAppApiUrl = useCallback(() => {
+    // Check if we're in development (localhost) or production
+    const isLocalhost = window.location.hostname === 'localhost' || 
+                        window.location.hostname === '127.0.0.1' ||
+                        window.location.hostname === '';
+    
+    // List of possible endpoints to try (in order of preference)
+    const endpoints = [];
+    
+    // Always try Vercel serverless function first (works everywhere if deployed)
+    // In development, this will work if Vercel is deployed
+    endpoints.push('/api/whatsapp-send');
+    
+    if (isLocalhost) {
+      // Development: Try localhost proxy server (if running separately)
+      // Note: This might conflict with React dev server on port 3000
+      // So we try it last as fallback
+      endpoints.push('http://localhost:3001/api/whatsapp-send');
+    }
+    
+    return endpoints;
+  }, []);
+
+  // Unified helper function to send WhatsApp message with retry logic
+  // NOTE: Cannot call WhatsApp API directly from browser due to CORS policy
+  // Must use proxy server (setupProxy.js) or Vercel serverless function
+  const sendWhatsAppMessageCore = useCallback(async (phoneNumber, message, phoneNumberId, apiKey, retries = 0) => {
+    const endpoints = getWhatsAppApiUrl();
+    let lastError = null;
+    
+    // Try each proxy endpoint (browser cannot call WhatsApp API directly due to CORS)
+    for (let endpointIndex = 0; endpointIndex < endpoints.length; endpointIndex++) {
+      const proxyApiUrl = endpoints[endpointIndex];
+      
+      try {
+        console.log(`📤 Attempting WhatsApp send via proxy (${endpointIndex + 1}/${endpoints.length}): ${proxyApiUrl}`);
+        
+        const payload = {
+          phone_number: phoneNumber,
+          message: message,
+          phone_number_id: phoneNumberId,
+          api_key: apiKey
+        };
+        
+        const response = await axios.post(proxyApiUrl, payload, {
+          timeout: 30000,
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          withCredentials: false,
+          validateStatus: function (status) {
+            return status >= 200 && status < 500; // Accept all to handle errors
+          }
+        });
+        
+        console.log(`📥 Response Status: ${response.status}`);
+        console.log(`📥 Response Type: ${typeof response.data}`);
+        
+        // Check if response is HTML error page (proxy server not running)
+        let result;
+        if (typeof response.data === 'string') {
+          // Check for HTML error pages
+          if (response.data.includes('<!DOCTYPE') || 
+              response.data.includes('<html') || 
+              response.data.includes('Cannot POST') ||
+              response.data.includes('<pre>') ||
+              response.data.includes('Error')) {
+            console.error('❌ HTML Error Page detected - Proxy server not running!');
+            console.error('Response preview:', response.data.substring(0, 200));
+            
+            // Create helpful error message
+            lastError = new Error('PROXY_SERVER_NOT_RUNNING');
+            continue; // Try next endpoint
+          }
+          
+          // Try to parse as JSON
+          try {
+            result = JSON.parse(response.data);
+          } catch (e) {
+            console.error('❌ Failed to parse JSON:', response.data.substring(0, 200));
+            lastError = new Error('Invalid JSON response from proxy');
+            continue;
+          }
+        } else {
+          result = response.data;
+        }
+        
+        // Check for errors in response
+        if (result && result.error) {
+          const errorMsg = result.error.message || JSON.stringify(result.error);
+          console.error('❌ WhatsApp API Error:', errorMsg);
+          lastError = new Error(errorMsg);
+          
+          // If it's a validation error, don't retry other endpoints
+          if (result.error.code === 400 || result.error.code === 401) {
+            throw lastError;
+          }
+          continue; // Try next endpoint
+        }
+        
+        // Check for success
+        if (result && result.success === true) {
+          const messageId = result.message_id || result.data?.messages?.[0]?.id || null;
+          const waId = result.data?.contacts?.[0]?.wa_id || null;
+          console.log(`✅ WhatsApp message sent successfully! Message ID: ${messageId}`);
+          return { success: true, messageId, waId, data: result };
+        }
+        
+        // Check for WhatsApp API direct format (if proxy returns it directly)
+        if (result && result.messages && result.messages[0]?.id) {
+          const messageId = result.messages[0].id;
+          const waId = result.contacts?.[0]?.wa_id || null;
+          console.log(`✅ WhatsApp message sent successfully! Message ID: ${messageId}`);
+          return { success: true, messageId, waId, data: result };
+        }
+        
+        // HTTP 200 but unclear format
+        if (response.status === 200 && result && result.contacts && result.contacts[0]) {
+          const messageId = result.messages?.[0]?.id || null;
+          const waId = result.contacts[0].wa_id || null;
+          console.log(`✅ WhatsApp message sent (HTTP 200 with contacts)`);
+          return { success: true, messageId, waId, data: result };
+        }
+        
+        console.warn('⚠️ Unexpected response format:', result);
+        lastError = new Error('Unexpected response format');
+        
+      } catch (err) {
+        console.error(`❌ Error on endpoint ${endpointIndex + 1}:`, err.message);
+        
+        if (err.response) {
+          console.error('Response status:', err.response.status);
+          console.error('Response data:', err.response.data);
+        }
+        
+        lastError = err;
+        
+        // If it's a network error (connection refused), try next endpoint
+        if (err.code === 'ECONNREFUSED' || err.code === 'ERR_CONNECTION_REFUSED' || err.code === 'ERR_NETWORK') {
+          console.log(`⚠️ Connection refused - proxy server not running`);
+          // Continue to next endpoint
+          continue;
+        }
+        
+        // If it's a 404 or HTML error, try next endpoint
+        if (err.response && (err.response.status === 404 || 
+            (typeof err.response.data === 'string' && err.response.data.includes('<html')))) {
+          console.log(`⚠️ 404/HTML error - trying next endpoint`);
+          continue;
+        }
+      }
+    }
+    
+    // All endpoints failed
+    if (lastError && lastError.message === 'PROXY_SERVER_NOT_RUNNING') {
+      const proxyError = new Error('PROXY_SERVER_REQUIRED');
+      proxyError.details = 'Proxy server is not running. Please start it with: npm run server';
+      throw proxyError;
+    }
+    
+    throw lastError || new Error('Failed to send WhatsApp message - all endpoints failed');
+  }, [getWhatsAppApiUrl]);
+
   const sendWhatsAppMessageAuto = useCallback(async (voter, targetNumber) => {
     try {
       // Clean and validate number
@@ -275,122 +440,23 @@ function App() {
         `⚧️ *लिंग:* ${voterDetails.gender || '-'}\n` +
         `🎂 *वय:* ${voterDetails.age || '-'}\n` +
         `🆔 *मतदान कार्ड क्र.:* ${voterDetails.epic_id || '-'}\n` +
-        `📱 *मोबाइल नं.:* ${voterDetails.mobile || '-'}`;
-      // WhatsApp API Configuration
-      const phoneNumberId = '741032182432100';
-      const apiKey = '798422d2-818f-11f0-98fc-02c8a5e042bd';
+        `📱 *मोबाइल नं.:* ${voterDetails.mobile || '-'}\n\n` +
+        `Nana Walke Foundation`;
       
-      // Use proxy to avoid CORS issues
-      // In development: Direct call to proxy server (localhost:3001) - bypasses React dev server proxy
-      // In production: Use Vercel serverless function (/api/whatsapp-send)
+      // WhatsApp API Configuration - Use environment variables
+      const phoneNumberId = process.env.REACT_APP_WHATSAPP_PHONE_NUMBER_ID || '741032182432100';
+      const apiKey = process.env.REACT_APP_WHATSAPP_API_KEY || '798422d2-818f-11f0-98fc-02c8a5e042bd';
       
-      // Determine API URL based on environment
-      let proxyApiUrl;
-      if (process.env.NODE_ENV === 'development') {
-        // Development: Direct call to proxy server (bypasses React dev server proxy issues)
-        proxyApiUrl = 'http://localhost:3001/api/whatsapp-send';
-        console.log('🔧 Development mode: Using direct proxy server URL');
-      } else {
-        // Production: Use Vercel serverless function
-        proxyApiUrl = '/api/whatsapp-send';
-        console.log('🔧 Production mode: Using Vercel serverless function');
-      }
+      console.log(`📤 Sending WhatsApp to ${voterDetails.name_english || voterDetails.name_marathi} (${cleanNumber})`);
       
-      // Prepare payload for proxy server (which will call WhatsApp API server-side)
-      const payload = {
-        phone_number: cleanNumber, // Format: 919090385555 (with country code 91)
-        message: message,
-        phone_number_id: phoneNumberId,
-        api_key: apiKey
-      };
+      // Use unified core function
+      const result = await sendWhatsAppMessageCore(cleanNumber, message, phoneNumberId, apiKey);
       
-      console.log(`📤 Calling WhatsApp API for ${voterDetails.name_english || voterDetails.name_marathi} (${cleanNumber})`);
-      console.log(`📡 Proxy URL: ${proxyApiUrl}`);
-      console.log(`📱 Phone: ${cleanNumber} (format: 91XXXXXXXXXX)`);
-      
-      // Call Vercel serverless function (which will call WhatsApp API server-side)
-      const response = await axios.post(proxyApiUrl, payload, {
-        timeout: 30000,
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        withCredentials: false,
-        validateStatus: function (status) {
-          return status >= 200 && status < 500;
-        }
-      });
-      
-      console.log(`📥 WhatsApp API response status: ${response.status}`);
-      console.log(`📥 WhatsApp API response data:`, JSON.stringify(response.data, null, 2));
-      
-      // Check if response is valid JSON
-      let result;
-      if (typeof response.data === 'string') {
-        try {
-          result = JSON.parse(response.data);
-        } catch (e) {
-          console.error('❌ Failed to parse response as JSON:', response.data.substring(0, 200));
-          return false;
-        }
-      } else {
-        result = response.data;
-      }
-      
-      // Check for WhatsApp API errors first
-      if (result && result.error) {
-        console.error('❌ WhatsApp API Error:', result.error);
-        if (result.error.message) {
-          console.error('Error message:', result.error.message);
-        }
-        return false;
-      }
-      
-      // Check if message was sent successfully
-      if (result && result.success === true) {
-        const messageId = result.message_id || result.data?.messages?.[0]?.id || 'N/A';
-        const waId = result.data?.contacts?.[0]?.wa_id || null;
-        const contactExists = waId !== null;
-        
-        console.log(`✅ WhatsApp message sent successfully! Message ID: ${messageId}`);
-        console.log(`✅ Sent to ${cleanNumber} for ${voterDetails.name_english || voterDetails.name_marathi}`);
-        console.log(`📱 WA ID: ${waId || 'Not found'} - Contact registered: ${contactExists}`);
-        
-        // Log full response for debugging
-        if (messageId && messageId !== 'N/A') {
-          console.log(`✅ Message queued for delivery. Message ID: ${messageId}`);
-        } else {
-          console.warn(`⚠️ Message sent but no message ID returned`);
-        }
-        
-        return true;
-      } else if (result && result.success === false) {
-        // Explicit failure
-        const errorMsg = result.message || result.error?.message || 'WhatsApp API error';
-        console.error('❌ WhatsApp API returned failure:', errorMsg);
-        console.error('Full error response:', result);
-        return false;
-      } else if (result && result.messages && result.messages[0]?.id) {
-        // WhatsApp API direct format (has messages array)
-        const messageId = result.messages[0].id;
-        console.log(`✅ WhatsApp message sent successfully! Message ID: ${messageId}`);
-        console.log(`✅ Sent to ${cleanNumber} for ${voterDetails.name_english || voterDetails.name_marathi}`);
-        return true;
-      } else if (response.status === 200) {
-        // HTTP 200 - might be successful even without success flag
-        console.log(`✅ WhatsApp message sent (HTTP 200) to ${cleanNumber}`);
-        console.log(`⚠️ Response format:`, result);
-        // Check if response has contacts array (WhatsApp API success indicator)
-        if (result && result.contacts && result.contacts[0]) {
-          console.log(`✅ WhatsApp confirmed contact exists`);
-          return true;
-        }
-        // If no clear error, assume success for HTTP 200
+      if (result.success) {
+        console.log(`✅ Successfully sent to ${voterDetails.name_english || voterDetails.name_marathi}`);
         return true;
       }
       
-      console.error('❌ Unexpected response format:', result);
-      console.error('Response status:', response.status);
       return false;
       
     } catch (err) {
@@ -400,15 +466,9 @@ function App() {
         response: err.response?.data,
         status: err.response?.status
       });
-      
-      // Check for CORS errors
-      if (err.code === 'ERR_NETWORK' || err.message.includes('CORS')) {
-        console.error('❌ CORS error - WhatsApp API might not allow direct browser calls');
-      }
-      
       return false;
     }
-  }, []);
+  }, [sendWhatsAppMessageCore]);
 
   // Auto-send WhatsApp messages when search results are displayed
   useEffect(() => {
@@ -629,13 +689,12 @@ function App() {
       // Validate mobile number format (if provided)
       if (mobile && mobile.trim() && !/^\d{10}$/.test(mobile.trim())) {
         console.error('❌ Invalid mobile number format:', mobile);
-        return false;
-      }
+      return false;
+    }
       
-      // Use proxy in development, direct URL in production
-      const apiUrl = process.env.NODE_ENV === 'development'
-        ? '/api/Voter/update_mobile.php'
-        : '/api/Voter/update_mobile.php';
+      // API endpoint - Vercel will proxy to https://xtend.online/Voter/update_mobile.php
+      // This works in both development (via setupProxy) and production (via vercel.json rewrite)
+      const apiUrl = '/api/Voter/update_mobile.php';
       
       console.log('📤 Syncing voter data to database:', {
         epicId,
@@ -739,19 +798,19 @@ function App() {
         alert('वोटर सापडला नाही!');
         return;
       }
-
+      
       const epicId = voter['मतदान कार्ड क्र.'];
       if (!epicId) {
         alert('EPIC ID सापडला नाही!');
         return;
       }
-
+      
       // Update database FIRST (no localStorage)
       const updated = await updateVoterInDatabase(
-        epicId, 
+            epicId,
         newMobile, 
         voter['घर क्र.'], 
-        voter['अनु क्र.'], 
+            voter['अनु क्र.'],
         voterId
       );
 
@@ -783,7 +842,7 @@ function App() {
       } else {
         alert('✅ मोबाइल नंबर database से हटवला गेला!');
       }
-
+      
     } catch (err) {
       console.error('Error updating mobile:', err);
       const errorMsg = err?.response?.data?.message || err?.message || 'Database update failed';
@@ -885,7 +944,7 @@ function App() {
       if (newAddress && newAddress.trim()) {
         alert('✅ घर क्र. database में अपडेट केला गेला!\n\n' +
               '🏠 Address: ' + newAddress);
-      } else {
+          } else {
         alert('✅ घर क्र. database से हटवला गेला!');
       }
 
@@ -909,7 +968,8 @@ function App() {
     updateAddress(voterId, trimmedValue);
   }, [editAddressValue, updateAddress, updatingAddress]);
 
-  // Format voter details for WhatsApp message
+  // Format voter details for WhatsApp message (not currently used, kept for reference)
+  // eslint-disable-next-line no-unused-vars
   const formatVoterDetails = useCallback((voter) => {
     return [
       '📋 *मतदार माहिती*',
@@ -977,109 +1037,24 @@ function App() {
         `⚧️ *लिंग:* ${voterDetails.gender || '-'}\n` +
         `🎂 *वय:* ${voterDetails.age || '-'}\n` +
         `🆔 *मतदान कार्ड क्र.:* ${voterDetails.epic_id || '-'}\n` +
-        `📱 *मोबाइल नं.:* ${voterDetails.mobile || '-'}`;
-      // WhatsApp API Configuration - Use Vercel serverless function as proxy (CORS fix)
-      const phoneNumberId = '741032182432100';
-      const apiKey = '798422d2-818f-11f0-98fc-02c8a5e042bd';
+        `📱 *मोबाइल नं.:* ${voterDetails.mobile || '-'}\n\n` +
+        `Nana Walke Foundation`;
       
-      // Use proxy to avoid CORS issues
-      // In development: Direct call to proxy server (localhost:3001) - bypasses React dev server proxy
-      // In production: Use Vercel serverless function (/api/whatsapp-send)
+      // WhatsApp API Configuration - Use environment variables
+      const phoneNumberId = process.env.REACT_APP_WHATSAPP_PHONE_NUMBER_ID || '741032182432100';
+      const apiKey = process.env.REACT_APP_WHATSAPP_API_KEY || '798422d2-818f-11f0-98fc-02c8a5e042bd';
       
-      // Determine API URL based on environment
-      let proxyApiUrl;
-      if (process.env.NODE_ENV === 'development') {
-        // Development: Direct call to proxy server (bypasses React dev server proxy issues)
-        proxyApiUrl = 'http://localhost:3001/api/whatsapp-send';
-        console.log('🔧 Development mode: Using direct proxy server URL');
-      } else {
-        // Production: Use Vercel serverless function
-        proxyApiUrl = '/api/whatsapp-send';
-        console.log('🔧 Production mode: Using Vercel serverless function');
-      }
-      
-      // Prepare payload for proxy server (which will call WhatsApp API server-side)
-      const payload = {
-        phone_number: cleanNumber, // Format: 919090385555 (with country code 91)
-        message: message,
-        phone_number_id: phoneNumberId,
-        api_key: apiKey
-      };
-      
-      console.log('📤 Sending WhatsApp message via proxy:');
-      console.log('  - Proxy URL:', proxyApiUrl);
+      console.log('📤 Sending WhatsApp message:');
       console.log('  - Phone Number:', cleanNumber, '(format: 91XXXXXXXXXX)');
       console.log('  - Voter:', voterDetails.name_english || voterDetails.name_marathi);
       console.log('  - Message Preview:', message.substring(0, 150) + '...');
-      console.log('  - Payload:', JSON.stringify(payload, null, 2));
       
-      // Use the determined API URL
-      const apiUrl = proxyApiUrl;
+      // Use unified core function with retry logic
+      const result = await sendWhatsAppMessageCore(cleanNumber, message, phoneNumberId, apiKey, 3);
       
-      // Call proxy endpoint (which forwards to local proxy server in development)
-      const response = await axios.post(apiUrl, payload, {
-        timeout: 30000,
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        withCredentials: false,
-        validateStatus: function (status) {
-          return status >= 200 && status < 500; // Accept all responses to handle errors properly
-        }
-      });
-      
-      console.log('📥 WhatsApp API Response Status:', response.status);
-      console.log('📥 WhatsApp API Response Type:', typeof response.data);
-      console.log('📥 WhatsApp API Response:', response.data);
-      
-      // Check if response is HTML error page (proxy not working)
-      if (typeof response.data === 'string') {
-        if (response.data.includes('<!DOCTYPE') || 
-            response.data.includes('<html') || 
-            response.data.includes('Cannot POST') ||
-            response.data.includes('<pre>')) {
-          console.error('❌ HTML Error Page Detected - Proxy not working!');
-          console.error('❌ Response:', response.data.substring(0, 500));
-          
-          const errorMsg = '❌ Proxy Connection Error!\n\n' +
-            'समस्या:\n' +
-            '• React app का proxy server तक connection नहीं हो रहा\n' +
-            '• Response HTML error page आ रही है (JSON नहीं)\n\n' +
-            'समाधान:\n' +
-            '1. ✅ Proxy server check करें: `npm run server` (port 3001)\n' +
-            '2. ✅ React app restart करें (Ctrl+C, फिर `npm start`)\n' +
-            '3. ✅ Browser console (F12) में setupProxy logs देखें\n' +
-            '4. ✅ Network tab में request URL check करें\n\n' +
-            'Expected: /api/whatsapp-send -> http://localhost:3001/api/whatsapp-send\n\n' +
-            'Error Details: ' + response.data.substring(0, 200);
-          
-          alert(errorMsg);
-          throw new Error('Proxy connection failed - HTML error page received');
-        }
-        
-        // Try to parse as JSON
-        try {
-          result = JSON.parse(response.data);
-        } catch (e) {
-          console.error('❌ Failed to parse response as JSON:', response.data.substring(0, 200));
-          throw new Error('Invalid response from WhatsApp API. Server may be returning an error page.');
-        }
-      } else {
-        result = response.data;
-      }
-      
-      // Check for WhatsApp API errors
-      if (result && result.error) {
-        const errorMsg = result.error.message || JSON.stringify(result.error);
-        console.error('❌ WhatsApp API Error:', result.error);
-        throw new Error('WhatsApp API Error: ' + errorMsg);
-      }
-      
-      // Check if message was sent successfully
-      if (result && result.success === true) {
-        const messageId = result.message_id || result.data?.messages?.[0]?.id || 'N/A';
-        const waId = result.data?.contacts?.[0]?.wa_id || null;
+      if (result.success) {
+        const messageId = result.messageId || 'N/A';
+        const waId = result.waId || null;
         const contactExists = waId !== null;
         
         console.log('✅ WhatsApp message sent successfully!');
@@ -1087,8 +1062,6 @@ function App() {
         console.log('  - Sent to:', cleanNumber);
         console.log('  - WA ID:', waId || 'Not found');
         console.log('  - Contact registered on WhatsApp:', contactExists);
-        console.log('  - Voter:', voterDetails.name_english || voterDetails.name_marathi);
-        console.log('  - Full API Response:', JSON.stringify(result, null, 2));
         
         let successMessage = '✅ WhatsApp message यशस्वीरित्या भेजला गेला!\n\n' + 
               `📱 Number: ${cleanNumber}\n` +
@@ -1124,41 +1097,9 @@ function App() {
           setWhatsappNumber('');
           setShowWhatsAppInput(false);
         }
-        return true;
-      } else if (result && result.success === false) {
-        // Explicit failure response
-        const errorMsg = result.message || result.error?.message || JSON.stringify(result.error) || 'WhatsApp API error';
-        console.error('❌ WhatsApp API returned failure:', result);
-        throw new Error('WhatsApp API Error: ' + errorMsg);
-      } else if (result && result.error) {
-        // Error in response (even if success not false)
-        const errorMsg = result.message || result.error?.message || JSON.stringify(result.error) || 'WhatsApp API error';
-        console.error('❌ WhatsApp API Error in response:', result.error);
-        throw new Error('WhatsApp API Error: ' + errorMsg);
-      } else if (response.status === 200 && !result.success) {
-        // HTTP 200 but no success flag - might be a different response format
-        console.warn('⚠️ HTTP 200 but no success flag. Response:', result);
-        
-        // Check if response has messages array (WhatsApp API format)
-        if (result.messages && result.messages[0]?.id) {
-          const messageId = result.messages[0].id;
-          console.log('✅ WhatsApp message sent (detected from messages array)');
-          alert('✅ WhatsApp message यशस्वीरित्या भेजला गेला!\n\n' + 
-                `📱 Number: ${cleanNumber}\n` +
-                `👤 Voter: ${voterDetails.name_english || voterDetails.name_marathi}\n` +
-                `📋 Message ID: ${messageId}\n\n` +
-                'कृपया recipient के WhatsApp में check करें।');
-          if (targetNumber) {
-            setWhatsappNumber('');
-            setShowWhatsAppInput(false);
-          }
           return true;
-        } else {
-          throw new Error('WhatsApp API error: Unexpected response format. Response: ' + JSON.stringify(result).substring(0, 200));
-        }
       } else {
-        console.error('❌ Unexpected response format:', result);
-        throw new Error('WhatsApp API error: Unexpected response format. Status: ' + response.status + ', Response: ' + JSON.stringify(result).substring(0, 200));
+        throw new Error('Failed to send WhatsApp message');
       }
       
     } catch (err) {
@@ -1170,106 +1111,80 @@ function App() {
         status: err.response?.status
       });
       
-      // Check for HTML error pages (proxy not working)
-      if (err.response && typeof err.response.data === 'string' && 
-          (err.response.data.includes('<!DOCTYPE') || 
-           err.response.data.includes('<html') || 
-           err.response.data.includes('Cannot POST') ||
-           err.response.data.includes('<pre>'))) {
-        const errorMsg = '❌ HTML Error Page - Proxy Not Working!\n\n' +
-          'समस्या:\n' +
-          '• React app का proxy server तक connection नहीं हो रहा\n' +
-          '• Response HTML error page आ रही है (JSON नहीं)\n\n' +
-          'समाधान:\n' +
-          '1. ✅ React app restart करें (Ctrl+C, फिर `npm start`)\n' +
-          '2. ✅ Proxy server check करें: `npm run server` (port 3001)\n' +
-          '3. ✅ Browser console (F12) में setupProxy initialization logs देखें\n' +
-          '4. ✅ Network tab में request URL check करें\n\n' +
-          'Expected: /api/whatsapp-send -> http://localhost:3001/api/whatsapp-send\n\n' +
-          'Error Details: ' + err.response.data.substring(0, 200);
-        alert(errorMsg);
-        console.error('❌ HTML Error Page Details:', {
-          status: err.response.status,
-          url: err.config?.url,
-          response: err.response.data.substring(0, 500)
-        });
-        return false;
-      }
+      // User-friendly error messages in Hindi
+      let errorMsg = '❌ WhatsApp message भेजने में समस्या आई\n\n';
       
-      // Check for network errors (proxy server not running)
-      if (err.code === 'ECONNREFUSED' || err.code === 'ERR_CONNECTION_REFUSED') {
-        const errorMsg = '❌ Connection Refused - Proxy Server Not Running!\n\n' +
-          'समस्या:\n' +
+      // Check for proxy server not running error
+      if (err.message === 'PROXY_SERVER_REQUIRED' || 
+          err.message.includes('PROXY_SERVER_NOT_RUNNING') ||
+          err.message.includes('HTML error page') ||
+          (err.response && typeof err.response.data === 'string' && err.response.data.includes('Cannot POST'))) {
+        errorMsg += '⚠️ **Proxy Server नहीं चल रहा है!**\n\n';
+        errorMsg += 'समस्या:\n';
+        errorMsg += '• Proxy server (port 3001) चल नहीं रहा\n';
+        errorMsg += '• Browser से directly WhatsApp API call नहीं हो सकता (CORS issue)\n\n';
+        errorMsg += '✅ **समाधान:**\n\n';
+        errorMsg += '**Option 1: Proxy Server Start करें**\n';
+        errorMsg += '1. नया terminal window खोलें\n';
+        errorMsg += '2. Run करें: `cd /Users/ashishpimple/Desktop/Voter-Search-App`\n';
+        errorMsg += '3. Run करें: `npm run server`\n';
+        errorMsg += '4. Wait करें: "🚀 WhatsApp API Proxy Server running..." message\n';
+        errorMsg += '5. इस terminal को open रखें\n';
+        errorMsg += '6. फिर से message भेजने की कोशिश करें\n\n';
+        errorMsg += '**Option 2: दोनों एक साथ Start करें**\n';
+        errorMsg += '1. सभी terminals बंद करें (Ctrl+C)\n';
+        errorMsg += '2. Run करें: `npm run dev`\n';
+        errorMsg += '3. यह proxy server और React app दोनों start करेगा\n\n';
+        errorMsg += '💡 **Note:** Proxy server बिना WhatsApp messages नहीं भेजे जा सकते!\n';
+      } else if (err.code === 'ECONNREFUSED' || err.code === 'ERR_CONNECTION_REFUSED') {
+        errorMsg += 'समस्या:\n' +
           '• Proxy server (port 3001) चल नहीं रहा\n\n' +
           'समाधान:\n' +
           '1. ✅ नया terminal खोलें\n' +
           '2. ✅ Run करें: `npm run server`\n' +
           '3. ✅ Wait करें: "🚀 WhatsApp API Proxy Server running..." message\n' +
-          '4. ✅ फिर से try करें\n\n' +
-          'Error: ' + err.message;
-        alert(errorMsg);
-        return false;
+          '4. ✅ फिर से try करें\n\n';
+      } else if (err.code === 'ERR_NETWORK' || err.message.includes('CORS')) {
+        errorMsg += '⚠️ **CORS Error - Proxy Server जरूरी है!**\n\n';
+        errorMsg += 'समस्या:\n' +
+          '• Browser से directly WhatsApp API call नहीं हो सकता\n' +
+          '• CORS policy block कर रही है\n\n' +
+          'समाधान:\n' +
+          '1. ✅ Proxy server start करें: `npm run server`\n' +
+          '2. ✅ Proxy server terminal को open रखें\n' +
+          '3. ✅ फिर से try करें\n\n';
+      } else if (err.response && err.response.status === 404) {
+        errorMsg += 'समस्या:\n' +
+          '• API endpoint नहीं मिल रहा है\n' +
+          '• Proxy server नहीं चल रहा\n\n' +
+          'समाधान:\n' +
+          '1. ✅ Proxy server start करें: `npm run server`\n' +
+          '2. ✅ Browser console (F12) में network tab देखें\n\n';
+      } else if (err.code === 'ECONNABORTED' || err.message.includes('timeout')) {
+        errorMsg += 'समस्या:\n' +
+          '• Request timeout हो गया\n' +
+          '• WhatsApp API response नहीं दे रहा\n\n' +
+          'समाधान:\n' +
+          '1. ✅ Internet connection check करें\n' +
+          '2. ✅ कुछ समय बाद फिर से try करें\n\n';
+      } else {
+        errorMsg += 'समस्या:\n' +
+          '• ' + (err.response?.data?.message || err.message || 'Unknown error') + '\n\n' +
+          'समाधान:\n' +
+          '1. ✅ API credentials verify करें\n' +
+          '2. ✅ Phone Number ID check करें\n' +
+          '3. ✅ Browser console (F12) में detailed error देखें\n\n';
       }
       
-      // Check for 404 errors
-      if (err.response && err.response.status === 404) {
-        alert('❌ 404 Error - Endpoint Not Found!\n\n' +
-              'समस्या:\n' +
-              '• `/api/whatsapp-send` endpoint नहीं मिल रहा है\n' +
-              '• Proxy setup काम नहीं कर रहा\n\n' +
-              'कृपया:\n' +
-              '1. ✅ Proxy server check करें: `npm run server` (port 3001)\n' +
-              '2. ✅ React app restart करें (Ctrl+C, फिर `npm start`)\n' +
-              '3. ✅ Browser console (F12) में setupProxy logs देखें\n' +
-              '4. ✅ Network tab में request URL check करें\n\n' +
-              'Expected URL: /api/whatsapp-send\n' +
-              'Actual URL: ' + (err.config?.url || 'unknown') + '\n\n' +
-              'Error: ' + (err.response?.data?.message || err.message || '404 Not Found'));
-        console.error('❌ 404 Error Details:', {
-          status: err.response.status,
-          url: err.config?.url,
-          response: err.response.data
-        });
-        return false;
-      }
+      errorMsg += 'Error: ' + (err.response?.data?.message || err.message || 'Unknown error');
       
-      // Check for CORS errors
-      if (err.code === 'ERR_NETWORK' || err.message.includes('CORS') || err.message.includes('Network Error') || err.message.includes('blocked')) {
-        alert('⚠️ Network/CORS Error!\n\n' +
-              'समस्या:\n' +
-              '• Proxy server reachable नहीं है\n' +
-              '• या connection error है\n\n' +
-              'कृपया:\n' +
-              '1. ✅ Proxy server check करें: `npm run server` (port 3001)\n' +
-              '2. ✅ Browser console (F12) में detailed error देखें\n\n' +
-              'Error: ' + (err.message || 'Network/CORS error'));
-        console.error('CORS Error Details:', err);
-        console.error('Proxy URL:', '/api/whatsapp-send');
-        return false;
-      }
-      
-      // Handle timeout error
-      if (err.code === 'ECONNABORTED' || err.message.includes('timeout')) {
-        alert('⏱️ Request Timeout!\n\n' +
-              'WhatsApp API response नहीं दे रहा है।\n' +
-              'कृपया बाद में try करें।\n\n' +
-              'Error: ' + err.message);
-        return false;
-      }
-      
-      // Show specific error message
-      const errorMsg = err.response?.data?.message || err.message || 'WhatsApp message भेजताना समस्या आली';
-      
-      alert(`❌ ${errorMsg}\n\nकृपया:\n` +
-            '1. ✅ API credentials verify करें\n' +
-            '2. ✅ Phone Number ID check करें\n' +
-            '3. ✅ Browser console (F12) में detailed error देखें');
+      alert(errorMsg);
       return false;
       
     } finally {
       setSendingWhatsApp(false);
     }
-  }, []);
+  }, [sendWhatsAppMessageCore]);
 
   // Share voter details on WhatsApp - show input modal
   const shareOnWhatsApp = useCallback((voter) => {
@@ -1307,7 +1222,7 @@ function App() {
       alert('❌ कृपया वैध 10 अंकी नंबर प्रविष्ट करा\n\nउदाहरण: 9090385555');
       return;
     }
-    
+
     // Validate Indian mobile format (starts with 6, 7, 8, or 9)
     const validPrefixes = ['6', '7', '8', '9'];
     if (!validPrefixes.includes(cleanNumber[0])) {
@@ -1467,21 +1382,21 @@ function App() {
         {showWhatsAppInput && (() => {
           const currentVoter = typeof selectedVoter === 'object' ? selectedVoter : voters.find(v => v.id === selectedVoter);
           return (
-            <div className="whatsapp-modal-overlay" onClick={() => setShowWhatsAppInput(false)}>
-              <div className="whatsapp-modal" onClick={(e) => e.stopPropagation()}>
-                <div className="whatsapp-modal-header">
-                  <h3>📱 WhatsApp Message भेजा</h3>
-                  <button 
-                    className="whatsapp-modal-close"
-                    onClick={() => {
-                      setShowWhatsAppInput(false);
-                      setWhatsappNumber('');
-                    }}
-                  >
-                    ✕
-                  </button>
-                </div>
-                <div className="whatsapp-modal-body">
+          <div className="whatsapp-modal-overlay" onClick={() => setShowWhatsAppInput(false)}>
+            <div className="whatsapp-modal" onClick={(e) => e.stopPropagation()}>
+              <div className="whatsapp-modal-header">
+                <h3>📱 WhatsApp Message भेजा</h3>
+                <button 
+                  className="whatsapp-modal-close"
+                  onClick={() => {
+                    setShowWhatsAppInput(false);
+                    setWhatsappNumber('');
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="whatsapp-modal-body">
                   {/* Voter Information Display */}
                   {currentVoter && (
                     <div className="whatsapp-voter-info">
@@ -1499,27 +1414,27 @@ function App() {
                     </div>
                   )}
                   
-                  <p className="whatsapp-modal-info">
-                    WhatsApp नंबर प्रविष्ट करा (10 अंकी)
-                  </p>
-                  <input
-                    type="tel"
-                    className="whatsapp-number-input"
-                    placeholder="9876543210"
-                    value={whatsappNumber}
+                <p className="whatsapp-modal-info">
+                  WhatsApp नंबर प्रविष्ट करा (10 अंकी)
+                </p>
+                <input
+                  type="tel"
+                  className="whatsapp-number-input"
+                  placeholder="9876543210"
+                  value={whatsappNumber}
                     onChange={(e) => {
                       // Only allow digits, max 10
                       const value = e.target.value.replace(/\D/g, '').slice(0, 10);
                       setWhatsappNumber(value);
                     }}
-                    onKeyPress={(e) => {
-                      if (e.key === 'Enter') {
-                        handleWhatsAppSend();
-                      }
-                    }}
+                  onKeyPress={(e) => {
+                    if (e.key === 'Enter') {
+                      handleWhatsAppSend();
+                    }
+                  }}
                     maxLength="10"
-                    autoFocus
-                  />
+                  autoFocus
+                />
                   {currentVoter && currentVoter['मोबाईल नं.'] && currentVoter['मोबाईल नं.'].trim() && (
                     <button
                       className="whatsapp-use-existing"
@@ -1540,27 +1455,27 @@ function App() {
                       📱 मौजूदा मोबाइल नंबर use करें: {currentVoter['मोबाईल नं.'].trim()}
                     </button>
                   )}
-                  <div className="whatsapp-modal-buttons">
-                    <button 
-                      className="whatsapp-modal-btn whatsapp-modal-cancel"
-                      onClick={() => {
-                        setShowWhatsAppInput(false);
-                        setWhatsappNumber('');
-                      }}
-                    >
-                      रद्द करा
-                    </button>
-                    <button 
-                      className="whatsapp-modal-btn whatsapp-modal-send"
-                      onClick={handleWhatsAppSend}
+                <div className="whatsapp-modal-buttons">
+                  <button 
+                    className="whatsapp-modal-btn whatsapp-modal-cancel"
+                    onClick={() => {
+                      setShowWhatsAppInput(false);
+                      setWhatsappNumber('');
+                    }}
+                  >
+                    रद्द करा
+                  </button>
+                  <button 
+                    className="whatsapp-modal-btn whatsapp-modal-send"
+                    onClick={handleWhatsAppSend}
                       disabled={!whatsappNumber.trim() || sendingWhatsApp || whatsappNumber.replace(/\D/g, '').length !== 10}
-                    >
-                      {sendingWhatsApp ? '⏳ भेजत आहे...' : '📱 WhatsApp वर भेजा'}
-                    </button>
-                  </div>
+                  >
+                    {sendingWhatsApp ? '⏳ भेजत आहे...' : '📱 WhatsApp वर भेजा'}
+                  </button>
                 </div>
               </div>
             </div>
+          </div>
           );
         })()}
 
@@ -1891,7 +1806,7 @@ function App() {
                                 </div>
                               </div>
                             ) : (
-                              <span className="card-value">{voter['घर क्र.'] || '-'}</span>
+                            <span className="card-value">{voter['घर क्र.'] || '-'}</span>
                             )}
                           </div>
                           

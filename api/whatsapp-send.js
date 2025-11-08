@@ -55,14 +55,48 @@ export default async function handler(req, res) {
       body: JSON.stringify(payload)
     });
 
-    const responseData = await response.json();
+    // Get response text first to handle errors properly
+    const responseText = await response.text();
+    let responseData;
+    
+    try {
+      responseData = JSON.parse(responseText);
+    } catch (parseError) {
+      // If response is not JSON, it's an error
+      console.error('❌ Invalid JSON response from WhatsApp API:', responseText);
+      return res.status(response.status || 500).json({
+        success: false,
+        error: 'Invalid response from WhatsApp API',
+        message: 'WhatsApp API returned invalid JSON response',
+        details: responseText.substring(0, 200)
+      });
+    }
 
     // Check if WhatsApp API returned an error
-    if (!response.ok || responseData.error) {
+    if (!response.ok) {
+      console.error('❌ WhatsApp API Error Response:', {
+        status: response.status,
+        statusText: response.statusText,
+        data: responseData
+      });
+      
       return res.status(response.status || 400).json({
         success: false,
-        error: responseData.error?.message || 'WhatsApp API error',
-        message: responseData.error?.message || 'Failed to send WhatsApp message'
+        error: responseData.error || responseData,
+        message: responseData.error?.message || responseData.message || `WhatsApp API error (${response.status})`,
+        details: responseData,
+        status_code: response.status
+      });
+    }
+    
+    // Check if response has error field even if status is OK
+    if (responseData.error) {
+      console.error('❌ WhatsApp API Error in response:', responseData.error);
+      return res.status(400).json({
+        success: false,
+        error: responseData.error,
+        message: responseData.error?.message || 'WhatsApp API error',
+        details: responseData
       });
     }
 
@@ -75,11 +109,33 @@ export default async function handler(req, res) {
     });
 
   } catch (error) {
-    console.error('WhatsApp API Error:', error);
+    console.error('❌ WhatsApp API Handler Error:', error);
+    console.error('Error Stack:', error.stack);
+    
+    // Handle specific error types
+    if (error.name === 'TypeError' && error.message.includes('fetch')) {
+      return res.status(500).json({
+        success: false,
+        error: 'Network error',
+        message: 'Failed to connect to WhatsApp API. Please check your internet connection.',
+        details: error.message
+      });
+    }
+    
+    if (error.name === 'SyntaxError') {
+      return res.status(500).json({
+        success: false,
+        error: 'Invalid response format',
+        message: 'WhatsApp API returned invalid response',
+        details: error.message
+      });
+    }
+    
     return res.status(500).json({
       success: false,
       error: error.message || 'Internal server error',
-      message: 'Failed to send WhatsApp message'
+      message: 'Failed to send WhatsApp message',
+      details: error.stack || error.toString()
     });
   }
 }
