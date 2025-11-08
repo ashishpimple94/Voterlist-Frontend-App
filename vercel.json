@@ -1,4 +1,8 @@
 {
+  "buildCommand": "npm run build",
+  "installCommand": "npm install",
+  "framework": "create-react-app",
+  "outputDirectory": "build",
   "rewrites": [
     {
       "source": "/api/Voter/(.*)",
