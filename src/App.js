@@ -1,6 +1,12 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import axios from 'axios';
 import './App.css';
+import { 
+  FaSearch, FaTimes, FaUser, FaUserAlt, FaChartBar, FaSync, 
+  FaWhatsapp, FaCheck, FaEdit, FaCopy, FaEye, FaSpinner,
+  FaHome, FaIdCard, FaMobileAlt, FaBirthdayCake, FaTag, 
+  FaMale, FaFemale, FaVoteYea, FaArrowLeft, FaArrowRight
+} from 'react-icons/fa';
 
 function App() {
   const [voters, setVoters] = useState([]);
@@ -21,6 +27,7 @@ function App() {
   const [editAddressValue, setEditAddressValue] = useState(''); // Temporary value while editing address
   const [updatingAddress, setUpdatingAddress] = useState(false); // Track address update loading state
   const [syncingToDatabase, setSyncingToDatabase] = useState(false); // Track database update status
+  const isFetchingRef = useRef(false); // Track if fetch is in progress to prevent multiple calls
   const [whatsappNumber, setWhatsappNumber] = useState(''); // WhatsApp number for sending message
   const [showWhatsAppInput, setShowWhatsAppInput] = useState(false); // Show/hide WhatsApp input
   const [sendingWhatsApp, setSendingWhatsApp] = useState(false); // Track WhatsApp sending status
@@ -104,7 +111,15 @@ function App() {
 
   // Fetch voter data
   const fetchVoterData = useCallback(async () => {
+    // Prevent multiple simultaneous calls
+    if (isFetchingRef.current) {
+      console.log('⚠️ fetchVoterData already in progress, skipping...');
+      return;
+    }
+    
     try {
+      isFetchingRef.current = true;
+      console.log('🔄 fetchVoterData called');
       setLoading(true);
       setError(null);
       
@@ -115,7 +130,7 @@ function App() {
       console.log('⏳ Starting API request...');
       
       const response = await axios.get(apiUrl, {
-        timeout: 120000, // Increased timeout to 2 minutes
+        timeout: 60000, // 60 seconds timeout
         headers: {
           'Accept': 'application/json',
           'Content-Type': 'application/json'
@@ -124,6 +139,15 @@ function App() {
         validateStatus: function (status) {
           return status >= 200 && status < 500; // Accept all responses to handle errors properly
         }
+      });
+      
+      console.log('📥 Full response:', {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+        dataLength: response.data ? (Array.isArray(response.data) ? response.data.length : Object.keys(response.data).length) : 0,
+        dataType: typeof response.data,
+        isArray: Array.isArray(response.data)
       });
       
       console.log('✅ API request completed');
@@ -183,7 +207,39 @@ function App() {
         console.log(`📊 Total count: ${result.count || result.totalCount || validVoters.length}`);
       } else {
         console.error('❌ Invalid API response format:', result);
-        setError(`API कडून डेटा मिळवण्यात समस्या आली। Response: ${JSON.stringify(result).substring(0, 100)}`);
+        console.error('❌ Full response:', JSON.stringify(result, null, 2));
+        
+        // Check if result has data but different structure
+        if (result && Array.isArray(result)) {
+          // If result is directly an array
+          console.log('📊 Response is direct array, mapping data...');
+          let validVoters = result
+            .filter((voter) => {
+              return voter && (voter.name || voter.name_mr || voter['नाव (इंग्रजी)'] || voter['नाव (मराठी)']);
+            })
+            .map((voter, index) => {
+              // Handle both API format and existing format
+              return {
+                'अनु क्र.': voter.serialNumber || voter['अनु क्र.'] || '',
+                'घर क्र.': voter.houseNumber || voter['घर क्र.'] || '',
+                'नाव (इंग्रजी)': voter.name || voter['नाव (इंग्रजी)'] || '',
+                'नाव (मराठी)': voter.name_mr || voter['नाव (मराठी)'] || '',
+                'लिंग (इंग्रजी)': voter.gender || voter['लिंग (इंग्रजी)'] || '',
+                'लिंग (मराठी)': voter.gender_mr || voter['लिंग (मराठी)'] || '',
+                'वय': (voter.age || voter['वय'] || '').toString(),
+                'मतदान कार्ड क्र.': voter.voterIdCard || voter['मतदान कार्ड क्र.'] || '',
+                'मोबाईल नं.': voter.mobileNumber || voter['मोबाईल नं.'] || '',
+                id: voter._id || voter.id || index + 1,
+                _originalId: voter._id || voter.id
+              };
+            });
+          
+          setVoters(validVoters);
+          console.log(`✅ Loaded ${validVoters.length} voter records (direct array format)`);
+          return;
+        }
+        
+        setError(`API कडून डेटा मिळवण्यात समस्या आली। Response format: ${JSON.stringify(result).substring(0, 200)}`);
       }
     } catch (err) {
       console.error('❌ Error fetching data:', err);
@@ -215,13 +271,15 @@ function App() {
       }
     } finally {
       setLoading(false);
+      isFetchingRef.current = false;
     }
-  }, []);
+  }, []); // Empty dependency array - fetchVoterData is stable
 
   // Load data on mount
   useEffect(() => {
+    console.log('🚀 App mounted, fetching voter data...');
     fetchVoterData();
-  }, [fetchVoterData]);
+  }, []); // Only run once on mount
 
   // Reset to page 1 when search query changes
   useEffect(() => {
@@ -696,22 +754,25 @@ function App() {
       // This works in both development (via setupProxy) and production (via vercel.json rewrite)
       const apiUrl = '/api/Voter/update_mobile.php';
       
-      console.log('📤 Syncing voter data to database:', {
-        epicId,
-        mobile: mobile || '(empty)',
-        address: address || '(empty)',
-        serialNo,
-        apiUrl
-      });
-      
-      const response = await axios.post(apiUrl, {
+      const requestData = {
         voter_id: voterId,
         epic_id: epicId.trim(),
         mobile: (mobile || '').trim(),
         address: address ? address.trim() : null,
         house_number: address ? address.trim() : null,
         serial_no: serialNo,
-      }, {
+      };
+      
+      console.log('📤 Syncing voter data to database:', {
+        epicId,
+        mobile: mobile || '(empty)',
+        address: address || '(empty)',
+        serialNo,
+        apiUrl,
+        requestData
+      });
+      
+      const response = await axios.post(apiUrl, requestData, {
         timeout: 15000,
         headers: {
           'Accept': 'application/json',
@@ -746,12 +807,15 @@ function App() {
         console.log('✅ Voter data updated in database successfully:', {
           epicId,
           mobile: mobile || '(removed)',
-          address: address || '(unchanged)'
+          address: address || '(unchanged)',
+          response: result
         });
+        console.log('✅ Database update confirmed - data synced to database');
         return true;
       } else {
-        const errorMsg = result?.message || 'Database update failed';
+        const errorMsg = result?.message || result?.error || 'Database update failed';
         console.error('❌ Database sync failed:', errorMsg);
+        console.error('❌ Response data:', result);
         throw new Error(errorMsg);
       }
     } catch (err) {
@@ -806,6 +870,7 @@ function App() {
       }
       
       // Update database FIRST (no localStorage)
+      console.log('🔄 Starting database update for mobile number...');
       const updated = await updateVoterInDatabase(
             epicId,
         newMobile, 
@@ -815,13 +880,19 @@ function App() {
       );
 
       if (!updated) {
+        console.error('❌ Database update failed - updateVoterInDatabase returned false');
+        setUpdatingMobile(false);
         alert('❌ Database में update नहीं हुआ!\n\n' +
               'कृपया:\n' +
-              '1. API endpoint check करें\n' +
+              '1. API endpoint check करें: /api/Voter/update_mobile.php\n' +
               '2. Database connection verify करें\n' +
-              '3. Console में error देखें');
+              '3. Console में error देखें\n' +
+              '4. Network tab में API request check करें');
+        // Keep editing state so user can try again
         return;
       }
+      
+      console.log('✅ Database update successful - mobile number synced to database');
 
       // Only update UI after successful database update
       setVoters(prevVoters => 
@@ -843,14 +914,23 @@ function App() {
         alert('✅ मोबाइल नंबर database से हटवला गेला!');
       }
       
+      // Note: UI already updated, no need to refresh from server
+      // User can manually refresh using Database Sync button if needed
+      
     } catch (err) {
-      console.error('Error updating mobile:', err);
+      console.error('❌ Error updating mobile:', err);
       const errorMsg = err?.response?.data?.message || err?.message || 'Database update failed';
-      alert(`❌ त्रुटी: ${errorMsg}\n\nDatabase में update नहीं हुआ!`);
+      console.error('❌ Error details:', {
+        message: errorMsg,
+        response: err?.response?.data,
+        status: err?.response?.status
+      });
+      alert(`❌ त्रुटी: ${errorMsg}\n\nDatabase में update नहीं हुआ!\n\nकृपया console में error देखें।`);
+      // Keep editing state so user can try again
     } finally {
       setUpdatingMobile(false);
     }
-  }, [voters, updateVoterInDatabase]);
+  }, [voters, updateVoterInDatabase]); // Removed fetchVoterData and searchQuery to prevent unnecessary re-renders
 
   // Save mobile number
   const saveMobileNumber = useCallback((voterId) => {
@@ -860,10 +940,16 @@ function App() {
     }
     
     const trimmedValue = editMobileValue.trim();
+    console.log('💾 Saving mobile number:', {
+      voterId,
+      value: trimmedValue,
+      length: trimmedValue.length
+    });
     
     // Allow empty value to remove mobile number
     if (trimmedValue === '') {
       // Empty value is valid (to remove mobile number)
+      console.log('🗑️ Removing mobile number');
       updateMobileNumber(voterId, '');
       return;
     }
@@ -883,6 +969,7 @@ function App() {
       return;
     }
     
+    console.log('✅ Validation passed, calling updateMobileNumber');
     updateMobileNumber(voterId, trimmedValue);
   }, [editMobileValue, updateMobileNumber, updatingMobile]);
 
@@ -911,6 +998,7 @@ function App() {
       }
 
       // Update database FIRST (no localStorage)
+      console.log('🔄 Starting database update for address...');
       const updated = await updateVoterInDatabase(
         epicId, 
         voter['मोबाईल नं.'], 
@@ -920,13 +1008,17 @@ function App() {
       );
 
       if (!updated) {
+        console.error('❌ Database update failed - updateVoterInDatabase returned false');
         alert('❌ Database में update नहीं हुआ!\n\n' +
               'कृपया:\n' +
-              '1. API endpoint check करें\n' +
+              '1. API endpoint check करें: /api/Voter/update_mobile.php\n' +
               '2. Database connection verify करें\n' +
-              '3. Console में error देखें');
+              '3. Console में error देखें\n' +
+              '4. Network tab में API request check करें');
         return;
       }
+      
+      console.log('✅ Database update successful - address synced to database');
 
       // Only update UI after successful database update
       setVoters(prevVoters => 
@@ -939,6 +1031,9 @@ function App() {
       
       setEditingAddress(null);
       setEditAddressValue('');
+      
+      // Note: UI already updated, no need to refresh from server
+      // User can manually refresh using Database Sync button if needed
       
       // Show success message
       if (newAddress && newAddress.trim()) {
@@ -955,7 +1050,7 @@ function App() {
     } finally {
       setUpdatingAddress(false);
     }
-  }, [voters, updateVoterInDatabase]);
+  }, [voters, updateVoterInDatabase]); // Removed fetchVoterData and searchQuery to prevent unnecessary re-renders
 
   // Save address
   const saveAddress = useCallback((voterId) => {
@@ -1246,7 +1341,20 @@ function App() {
       <div className="container">
         <header className="header">
           <div style={{position: 'relative', zIndex: 1}}>
-            <h1>🗳️ मतदार शोध प्रणाली</h1>
+            <div className="foundation-header">
+              <img 
+                src="/nana-walke-foundation.png" 
+                alt="नाना वाळके" 
+                className="foundation-image"
+                onError={(e) => {
+                  // If image doesn't exist, hide it
+                  e.target.style.display = 'none';
+                }}
+              />
+              <div className="foundation-name">नाना वाळके फाउंडेशन</div>
+              <div className="welcome-text">आपले स्वागत आहे</div>
+            </div>
+            <h1><FaVoteYea style={{marginRight: '10px', verticalAlign: 'middle'}} /> मतदार शोध प्रणाली</h1>
             <p className="subtitle">अधिकृत मतदार माहिती शोध प्रणाली</p>
           </div>
         </header>
@@ -1273,7 +1381,7 @@ function App() {
               />
               {searchTerm && (
                 <button className="clear-btn" onClick={clearSearch} title="साफ करा">
-                  ✕
+                  <FaTimes />
                 </button>
               )}
               <button 
@@ -1282,8 +1390,33 @@ function App() {
                 title="शोधा"
                 disabled={loading}
               >
-                🔍 शोधा
+                <FaSearch style={{marginRight: '8px'}} /> शोधा
               </button>
+            </div>
+            
+            {/* Database Sync Button */}
+            <div className="database-sync-wrapper">
+              <button 
+                className="database-sync-btn" 
+                onClick={fetchVoterData}
+                title="Database से data refresh करा"
+                disabled={loading || syncingToDatabase}
+              >
+                {loading || syncingToDatabase ? (
+                  <>
+                    <FaSpinner className="spinner-icon" style={{marginRight: '8px'}} />
+                    Sync होत आहे...
+                  </>
+                ) : (
+                  <>
+                    <FaSync style={{marginRight: '8px'}} />
+                    Database Sync
+                  </>
+                )}
+              </button>
+              {syncingToDatabase && (
+                <span className="sync-status">Database मध्ये sync होत आहे...</span>
+              )}
             </div>
             
             {/* Search Suggestions */}
@@ -1338,21 +1471,21 @@ function App() {
         {/* Stats Section */}
         <div className="stats-section">
           <div className="stat-card male">
-            <div className="stat-icon">👨</div>
+            <div className="stat-icon"><FaMale /></div>
             <div className="stat-info">
               <div className="stat-label">पुरुष</div>
               <div className="stat-value">{genderStats.males.toLocaleString()}</div>
             </div>
           </div>
           <div className="stat-card female">
-            <div className="stat-icon">👩</div>
+            <div className="stat-icon"><FaFemale /></div>
             <div className="stat-info">
               <div className="stat-label">महिला</div>
               <div className="stat-value">{genderStats.females.toLocaleString()}</div>
             </div>
           </div>
           <div className="stat-card total">
-            <div className="stat-icon">📊</div>
+            <div className="stat-icon"><FaChartBar /></div>
             <div className="stat-info">
               <div className="stat-label">कुल</div>
               <div className="stat-value">{genderStats.total.toLocaleString()}</div>
@@ -1363,7 +1496,7 @@ function App() {
         {/* Small Sync Loading Indicator */}
         {syncingToDatabase && (
           <div className="sync-loading-small">
-            <span className="sync-spinner-small">🔄</span>
+            <span className="sync-spinner-small"><FaSync /></span>
             <span className="sync-text-small">Database मध्ये sync होत आहे...</span>
           </div>
         )}
@@ -1371,9 +1504,9 @@ function App() {
         {/* Auto-send WhatsApp Status Indicator */}
         {autoSendingWhatsApp && (
           <div className="sync-loading-small" style={{background: 'linear-gradient(135deg, #25D366 0%, #128C7E 100%)', color: 'white'}}>
-            <span className="sync-spinner-small">📱</span>
+            <span className="sync-spinner-small"><FaWhatsapp /></span>
             <span className="sync-text-small">
-              WhatsApp messages भेजत आहे... ({autoSentCount} sent)
+              WhatsApp संदेश पाठवत आहे... ({autoSentCount} पाठवले)
             </span>
           </div>
         )}
@@ -1385,7 +1518,7 @@ function App() {
           <div className="whatsapp-modal-overlay" onClick={() => setShowWhatsAppInput(false)}>
             <div className="whatsapp-modal" onClick={(e) => e.stopPropagation()}>
               <div className="whatsapp-modal-header">
-                <h3>📱 WhatsApp Message भेजा</h3>
+                <h3><FaWhatsapp style={{marginRight: '8px'}} /> WhatsApp संदेश पाठवा</h3>
                 <button 
                   className="whatsapp-modal-close"
                   onClick={() => {
@@ -1393,7 +1526,7 @@ function App() {
                     setWhatsappNumber('');
                   }}
                 >
-                  ✕
+                  <FaTimes />
                 </button>
               </div>
               <div className="whatsapp-modal-body">
@@ -1442,17 +1575,8 @@ function App() {
                         const existingMobile = currentVoter['मोबाईल नं.'].replace(/\D/g, '').slice(0, 10);
                         setWhatsappNumber(existingMobile);
                       }}
-                      style={{
-                        marginTop: '8px',
-                        padding: '6px 12px',
-                        fontSize: '0.85rem',
-                        background: '#f0f0f0',
-                        border: '1px solid #ddd',
-                        borderRadius: '4px',
-                        cursor: 'pointer'
-                      }}
                     >
-                      📱 मौजूदा मोबाइल नंबर use करें: {currentVoter['मोबाईल नं.'].trim()}
+                      <FaMobileAlt /> मौजूदा मोबाइल नंबर वापरा: {currentVoter['मोबाईल नं.'].trim()}
                     </button>
                   )}
                 <div className="whatsapp-modal-buttons">
@@ -1470,7 +1594,15 @@ function App() {
                     onClick={handleWhatsAppSend}
                       disabled={!whatsappNumber.trim() || sendingWhatsApp || whatsappNumber.replace(/\D/g, '').length !== 10}
                   >
-                    {sendingWhatsApp ? '⏳ भेजत आहे...' : '📱 WhatsApp वर भेजा'}
+                    {sendingWhatsApp ? (
+                      <>
+                        <FaSpinner className="spinner-icon" style={{marginRight: '8px'}} /> भेजत आहे...
+                      </>
+                    ) : (
+                      <>
+                        <FaWhatsapp style={{marginRight: '8px'}} /> WhatsApp वर भेजा
+                      </>
+                    )}
                   </button>
                 </div>
               </div>
@@ -1492,7 +1624,7 @@ function App() {
           <div className="error">
             <p>{error}</p>
             <button onClick={fetchVoterData} className="retry-btn">
-              🔄 पुनः प्रयास करें
+              <FaSync style={{marginRight: '8px'}} /> पुनः प्रयास करें
             </button>
           </div>
         )}
@@ -1502,13 +1634,13 @@ function App() {
           <div className="results-section">
             {!searchQuery.trim() ? (
               <div className="no-results">
-                <div className="no-results-icon">🔍</div>
+                <div className="no-results-icon"><FaSearch /></div>
                 <p>शोध सुरू करा</p>
                 <p className="no-results-hint">नाव, मतदान कार्ड क्र., मोबाइल नंबर किंवा इतर माहितीद्वारे शोधा</p>
               </div>
             ) : filteredVoters.length === 0 ? (
               <div className="no-results">
-                <div className="no-results-icon">🔍</div>
+                <div className="no-results-icon"><FaSearch /></div>
                 <p>कोणतेही परिणाम सापडले नाही</p>
                 <p className="no-results-hint">कृपया वेगळी कीवर्ड वापरून शोधा</p>
               </div>
@@ -1569,7 +1701,7 @@ function App() {
                                       disabled={updatingAddress}
                                       title="सेव करा"
                                     >
-                                      {updatingAddress ? '⏳' : '✓'}
+                                      {updatingAddress ? <FaSpinner className="spinner-icon" /> : <FaCheck />}
                                     </button>
                                     <button
                                       className="address-cancel-btn"
@@ -1580,7 +1712,7 @@ function App() {
                                       disabled={updatingAddress}
                                       title="रद्द करा"
                                     >
-                                      ✕
+                                      <FaTimes />
                                     </button>
                                   </div>
                                 </div>
@@ -1646,7 +1778,7 @@ function App() {
                                       disabled={updatingMobile}
                                       title="सेव करा"
                                     >
-                                      {updatingMobile ? '⏳' : '✓'}
+                                      {updatingMobile ? <FaSpinner className="spinner-icon" /> : <FaCheck />}
                                     </button>
                                     <button
                                       className="mobile-cancel-btn"
@@ -1657,7 +1789,7 @@ function App() {
                                       disabled={updatingMobile}
                                       title="रद्द करा"
                                     >
-                                      ✕
+                                      <FaTimes />
                                     </button>
                                   </div>
                                 </div>
@@ -1681,7 +1813,7 @@ function App() {
                                     }}
                                     title="संपादित करा"
                                   >
-                                    ✏️
+                                    <FaEdit />
                                   </button>
                                 </div>
                               )}
@@ -1694,9 +1826,9 @@ function App() {
                                     e.stopPropagation();
                                     shareOnWhatsApp(voter);
                                   }}
-                                  title="WhatsApp वर share करा"
+                                  title="WhatsApp वर सामायिक करा"
                                 >
-                                  📱 WhatsApp
+                                  <FaWhatsapp style={{marginRight: '6px'}} /> WhatsApp वर भेजा
                                 </button>
                                 <button 
                                   className="action-btn"
@@ -1706,7 +1838,7 @@ function App() {
                                   }}
                                   title="तपशील पहा"
                                 >
-                                  👁️ पहा
+                                  <FaEye style={{marginRight: '6px'}} /> पहा
                                 </button>
                               </div>
                             </td>
@@ -1790,7 +1922,7 @@ function App() {
                                     disabled={updatingAddress}
                                     title="सेव करा"
                                   >
-                                    {updatingAddress ? '⏳' : '✓'}
+                                    {updatingAddress ? <FaSpinner className="spinner-icon" /> : <FaCheck />}
                                   </button>
                                   <button
                                     className="card-cancel-btn"
@@ -1801,7 +1933,7 @@ function App() {
                                     disabled={updatingAddress}
                                     title="रद्द करा"
                                   >
-                                    ✕
+                                    <FaTimes />
                                   </button>
                                 </div>
                               </div>
@@ -1818,7 +1950,7 @@ function App() {
                           >
                             <span className="card-label">मतदान कार्ड क्र.:</span>
                             <span className="card-value epic-id">{voter['मतदान कार्ड क्र.'] || '-'}</span>
-                            <span className="copy-icon">📋</span>
+                            <span className="copy-icon"><FaCopy /></span>
                           </div>
                           
                           <div className="card-row">
@@ -1852,7 +1984,7 @@ function App() {
                                     disabled={updatingMobile}
                                     title="सेव करा"
                                   >
-                                    {updatingMobile ? '⏳' : '✓'}
+                                    {updatingMobile ? <FaSpinner className="spinner-icon" /> : <FaCheck />}
                                   </button>
                                   <button
                                     className="mobile-cancel-btn-mobile"
@@ -1863,7 +1995,7 @@ function App() {
                                     disabled={updatingMobile}
                                     title="रद्द करा"
                                   >
-                                    ✕
+                                    <FaTimes />
                                   </button>
                                 </div>
                               </div>
@@ -1886,7 +2018,7 @@ function App() {
                                   }}
                                   title="संपादित करा"
                                 >
-                                  ✏️
+                                  <FaEdit />
                                 </button>
                               </div>
                             )}
@@ -1902,7 +2034,7 @@ function App() {
                               }}
                               title="WhatsApp वर share करा"
                             >
-                              📱 WhatsApp वर Share करा
+                              <FaWhatsapp style={{marginRight: '8px'}} /> WhatsApp वर सामायिक करा
                             </button>
                           </div>
                         </div>
@@ -1940,7 +2072,7 @@ function App() {
                       onClick={() => goToPage(currentPage - 1)}
                       disabled={currentPage === 1}
                     >
-                      ← मागील
+                      <FaArrowLeft style={{marginRight: '6px'}} /> मागील
                     </button>
                     
                     <div className="page-info">
@@ -1955,7 +2087,7 @@ function App() {
                       onClick={() => goToPage(currentPage + 1)}
                       disabled={currentPage === totalPages}
                     >
-                      पुढील →
+                      पुढील <FaArrowRight style={{marginLeft: '6px'}} />
                     </button>
                   </div>
                 )}
