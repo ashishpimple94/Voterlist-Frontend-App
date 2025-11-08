@@ -84,17 +84,25 @@ function App() {
     });
   }, [voters, searchQuery]);
 
-  // Memoized: Calculate gender counts from full database (all voters)
+  // Memoized: Calculate gender counts from full database (all voters) - optimized single pass
   const genderStats = useMemo(() => {
-    const males = voters.filter(voter => 
-      voter['लिंग (इंग्रजी)'] === 'Male' || voter['लिंग (मराठी)'] === 'पुरुष'
-    ).length;
+    let males = 0;
+    let females = 0;
+    const len = voters.length;
     
-    const females = voters.filter(voter => 
-      voter['लिंग (इंग्रजी)'] === 'Female' || voter['लिंग (मराठी)'] === 'स्त्री'
-    ).length;
+    for (let i = 0; i < len; i++) {
+      const voter = voters[i];
+      const genderEn = voter['लिंग (इंग्रजी)'];
+      const genderMr = voter['लिंग (मराठी)'];
+      
+      if (genderEn === 'Male' || genderMr === 'पुरुष') {
+        males++;
+      } else if (genderEn === 'Female' || genderMr === 'स्त्री') {
+        females++;
+      }
+    }
     
-    return { males, females, total: voters.length };
+    return { males, females, total: len };
   }, [voters]);
 
   // Memoized: Paginated voters
@@ -109,56 +117,35 @@ function App() {
 
   // No localStorage - data comes directly from database
 
-  // Fetch voter data
+  // Fetch voter data - Optimized for faster loading
   const fetchVoterData = useCallback(async () => {
     // Prevent multiple simultaneous calls
     if (isFetchingRef.current) {
-      console.log('⚠️ fetchVoterData already in progress, skipping...');
       return;
     }
     
     try {
       isFetchingRef.current = true;
-      console.log('🔄 fetchVoterData called');
       setLoading(true);
       setError(null);
       
       // Use new Node.js API endpoint
       const apiUrl = 'https://nodejs-2-i1dr.onrender.com/api/voters/';
       
-      console.log('📡 Fetching voter data from:', apiUrl);
-      console.log('⏳ Starting API request...');
-      
       const response = await axios.get(apiUrl, {
-        timeout: 60000, // 60 seconds timeout
+        timeout: 25000, // Reduced to 25 seconds for faster timeout
         headers: {
           'Accept': 'application/json',
           'Content-Type': 'application/json'
         },
         withCredentials: false,
         validateStatus: function (status) {
-          return status >= 200 && status < 500; // Accept all responses to handle errors properly
+          return status >= 200 && status < 500;
         }
       });
       
-      console.log('📥 Full response:', {
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers,
-        dataLength: response.data ? (Array.isArray(response.data) ? response.data.length : Object.keys(response.data).length) : 0,
-        dataType: typeof response.data,
-        isArray: Array.isArray(response.data)
-      });
-      
-      console.log('✅ API request completed');
-      
-      console.log('📥 API Response Status:', response.status);
-      console.log('📥 API Response Headers:', response.headers['content-type']);
-      console.log('📥 API Response Data Type:', typeof response.data);
-      
       // Check if response is HTML (error page)
       if (typeof response.data === 'string' && (response.data.includes('<!DOCTYPE') || response.data.includes('<html'))) {
-        console.error('❌ API returned HTML instead of JSON.');
         setError('API HTML error response मिळाला। कृपया API endpoint verify करें।');
         return;
       }
@@ -169,88 +156,57 @@ function App() {
         try {
           result = JSON.parse(response.data);
         } catch (e) {
-          console.error('❌ Failed to parse JSON:', response.data.substring(0, 200));
           setError('API ने invalid JSON return किया। कृपया API endpoint check करें।');
           return;
         }
       }
       
-      console.log('📊 Parsed Result:', result);
+      // Optimized data processing - single pass for better performance
+      let validVoters = [];
+      const dataArray = (result && result.success && result.data && Array.isArray(result.data)) 
+        ? result.data 
+        : (result && Array.isArray(result)) 
+          ? result 
+          : null;
       
-      // Handle Node.js API response format: { success: true, data: [...], count: ... }
-      if (result && result.success && result.data && Array.isArray(result.data)) {
-        // Map Node.js API fields to existing field names
-        let validVoters = result.data
-          .filter((voter) => {
-            // Filter out empty records
-            return voter && (voter.name || voter.name_mr) && (voter.name?.trim() || voter.name_mr?.trim());
-          })
-          .map((voter, index) => {
-            // Map Node.js API fields to existing field names used in the app
-            return {
-              'अनु क्र.': voter.serialNumber || '',
-              'घर क्र.': voter.houseNumber || '',
-              'नाव (इंग्रजी)': voter.name || '',
-              'नाव (मराठी)': voter.name_mr || '',
-              'लिंग (इंग्रजी)': voter.gender || '',
-              'लिंग (मराठी)': voter.gender_mr || '',
-              'वय': voter.age ? voter.age.toString() : '',
-              'मतदान कार्ड क्र.': voter.voterIdCard || '',
-              'मोबाईल नं.': voter.mobileNumber || '',
-              id: voter._id || index + 1, // Use MongoDB _id or index
-              _originalId: voter._id // Keep original ID for reference
-            };
-          });
+      if (dataArray) {
+        // Single optimized pass - filter and map together for better performance
+        validVoters = [];
+        const len = dataArray.length;
         
-        setVoters(validVoters);
-        console.log(`✅ Loaded ${validVoters.length} voter records from Node.js API`);
-        console.log(`📊 Total count: ${result.count || result.totalCount || validVoters.length}`);
-      } else {
-        console.error('❌ Invalid API response format:', result);
-        console.error('❌ Full response:', JSON.stringify(result, null, 2));
-        
-        // Check if result has data but different structure
-        if (result && Array.isArray(result)) {
-          // If result is directly an array
-          console.log('📊 Response is direct array, mapping data...');
-          let validVoters = result
-            .filter((voter) => {
-              return voter && (voter.name || voter.name_mr || voter['नाव (इंग्रजी)'] || voter['नाव (मराठी)']);
-            })
-            .map((voter, index) => {
-              // Handle both API format and existing format
-              return {
-                'अनु क्र.': voter.serialNumber || voter['अनु क्र.'] || '',
-                'घर क्र.': voter.houseNumber || voter['घर क्र.'] || '',
-                'नाव (इंग्रजी)': voter.name || voter['नाव (इंग्रजी)'] || '',
-                'नाव (मराठी)': voter.name_mr || voter['नाव (मराठी)'] || '',
-                'लिंग (इंग्रजी)': voter.gender || voter['लिंग (इंग्रजी)'] || '',
-                'लिंग (मराठी)': voter.gender_mr || voter['लिंग (मराठी)'] || '',
-                'वय': (voter.age || voter['वय'] || '').toString(),
-                'मतदान कार्ड क्र.': voter.voterIdCard || voter['मतदान कार्ड क्र.'] || '',
-                'मोबाईल नं.': voter.mobileNumber || voter['मोबाईल नं.'] || '',
-                id: voter._id || voter.id || index + 1,
-                _originalId: voter._id || voter.id
-              };
-            });
+        for (let i = 0; i < len; i++) {
+          const voter = dataArray[i];
           
-          setVoters(validVoters);
-          console.log(`✅ Loaded ${validVoters.length} voter records (direct array format)`);
-          return;
+          // Quick validation check
+          if (!voter) continue;
+          const hasName = voter.name || voter.name_mr || voter['नाव (इंग्रजी)'] || voter['नाव (मराठी)'];
+          if (!hasName || (!voter.name?.trim() && !voter.name_mr?.trim() && !voter['नाव (इंग्रजी)']?.trim() && !voter['नाव (मराठी)']?.trim())) {
+            continue;
+          }
+          
+          // Map fields efficiently
+          validVoters.push({
+            'अनु क्र.': voter.serialNumber || voter['अनु क्र.'] || '',
+            'घर क्र.': voter.houseNumber || voter['घर क्र.'] || '',
+            'नाव (इंग्रजी)': voter.name || voter['नाव (इंग्रजी)'] || '',
+            'नाव (मराठी)': voter.name_mr || voter['नाव (मराठी)'] || '',
+            'लिंग (इंग्रजी)': voter.gender || voter['लिंग (इंग्रजी)'] || '',
+            'लिंग (मराठी)': voter.gender_mr || voter['लिंग (मराठी)'] || '',
+            'वय': String(voter.age || voter['वय'] || ''),
+            'मतदान कार्ड क्र.': voter.voterIdCard || voter['मतदान कार्ड क्र.'] || '',
+            'मोबाईल नं.': voter.mobileNumber || voter['मोबाईल नं.'] || '',
+            id: voter._id || voter.id || i + 1,
+            _originalId: voter._id || voter.id
+          });
         }
         
+        setVoters(validVoters);
+        setLoading(false);
+      } else {
         setError(`API कडून डेटा मिळवण्यात समस्या आली। Response format: ${JSON.stringify(result).substring(0, 200)}`);
+        setLoading(false);
       }
     } catch (err) {
-      console.error('❌ Error fetching data:', err);
-      console.error('Error details:', {
-        code: err.code,
-        message: err.message,
-        response: err.response?.data,
-        status: err.response?.status,
-        headers: err.response?.headers
-      });
-      
       if (err.code === 'ECONNABORTED') {
         setError('विनंती टाइमआउट! कृपया नंतर पुन्हा प्रयत्न करा।');
       } else if (err.response) {
@@ -258,7 +214,6 @@ function App() {
         const statusText = err.response.statusText || 'Unknown Error';
         const errorData = err.response.data;
         
-        // Check if it's HTML error
         if (typeof errorData === 'string' && (errorData.includes('<!DOCTYPE') || errorData.includes('<html'))) {
           setError(`सर्व्हर त्रुटी (${status}): API HTML error page return कर रहा है। कृपया API endpoint verify करें।`);
         } else {
@@ -269,15 +224,14 @@ function App() {
       } else {
         setError(`त्रुटी: ${err.message || 'डेटा लोड करण्यात समस्या आली।'}`);
       }
-    } finally {
       setLoading(false);
+    } finally {
       isFetchingRef.current = false;
     }
   }, []); // Empty dependency array - fetchVoterData is stable
 
   // Load data on mount
   useEffect(() => {
-    console.log('🚀 App mounted, fetching voter data...');
     fetchVoterData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Only run once on mount - fetchVoterData is stable with empty deps
