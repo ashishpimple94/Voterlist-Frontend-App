@@ -8,6 +8,110 @@ import {
   FaMale, FaFemale, FaVoteYea, FaArrowLeft, FaArrowRight
 } from 'react-icons/fa';
 
+// ==================== Load Balancing Configuration ====================
+// Multiple API endpoints for load balancing
+const API_ENDPOINTS = [
+  'https://nodejs-2-i1dr.onrender.com/api/voters/',
+  // Add more endpoints here when available
+  // 'https://api2.example.com/api/voters/',
+  // 'https://api3.example.com/api/voters/',
+];
+
+// Load balancing strategy: 'failover' (default), 'roundRobin', 'random'
+const LOAD_BALANCE_STRATEGY = process.env.REACT_APP_LOAD_BALANCE_STRATEGY || 'failover';
+
+// Endpoint health tracking (shared across instances)
+const endpointHealthMap = new Map();
+API_ENDPOINTS.forEach(url => {
+  endpointHealthMap.set(url, {
+    healthy: true,
+    lastChecked: 0,
+    responseTime: 0,
+    failures: 0,
+    successCount: 0
+  });
+});
+
+// Round-robin counter
+let roundRobinCounter = 0;
+
+// Health check interval (5 minutes)
+const HEALTH_CHECK_INTERVAL = 5 * 60 * 1000;
+
+// Get next endpoint based on strategy
+const getNextEndpoint = (strategy = LOAD_BALANCE_STRATEGY) => {
+  const healthyEndpoints = API_ENDPOINTS.filter(url => {
+    const health = endpointHealthMap.get(url);
+    return health && health.healthy;
+  });
+
+  if (healthyEndpoints.length === 0) {
+    // All endpoints unhealthy, use first one anyway
+    return API_ENDPOINTS[0];
+  }
+
+  switch (strategy) {
+    case 'roundRobin':
+      const index = roundRobinCounter % healthyEndpoints.length;
+      roundRobinCounter++;
+      return healthyEndpoints[index];
+    
+    case 'random':
+      return healthyEndpoints[Math.floor(Math.random() * healthyEndpoints.length)];
+    
+    case 'failover':
+    default:
+      // Return first healthy endpoint (primary)
+      return healthyEndpoints[0];
+  }
+};
+
+// Update endpoint health status
+const updateEndpointHealth = (url, success, responseTime) => {
+  const health = endpointHealthMap.get(url);
+  if (!health) return;
+
+  if (success) {
+    health.healthy = true;
+    health.failures = 0;
+    health.successCount++;
+    health.responseTime = responseTime;
+  } else {
+    health.failures++;
+    // Mark as unhealthy after 3 consecutive failures
+    if (health.failures >= 3) {
+      health.healthy = false;
+    }
+  }
+  health.lastChecked = Date.now();
+};
+
+// Health check function
+const checkEndpointHealth = async (url) => {
+  try {
+    const startTime = Date.now();
+    const response = await axios.get(url, {
+      timeout: 10000,
+      headers: { 'Accept': 'application/json' },
+      validateStatus: (status) => status >= 200 && status < 500
+    });
+    const responseTime = Date.now() - startTime;
+    
+    const isHealthy = response.status === 200 && 
+                     response.data && 
+                     (Array.isArray(response.data) || 
+                      (response.data.success && Array.isArray(response.data.data)));
+    
+    updateEndpointHealth(url, isHealthy, responseTime);
+    return isHealthy;
+  } catch (error) {
+    updateEndpointHealth(url, false, 0);
+    return false;
+  }
+};
+
+// ==================== End Load Balancing Configuration ====================
+
 function App() {
   const [voters, setVoters] = useState([]);
   const [searchTerm, setSearchTerm] = useState('');
@@ -117,7 +221,7 @@ function App() {
 
   // No localStorage - data comes directly from database
 
-  // Fetch voter data - Optimized for faster loading
+  // Fetch voter data - Optimized with Load Balancing
   const fetchVoterData = useCallback(async () => {
     // Prevent multiple simultaneous calls
     if (isFetchingRef.current) {
@@ -129,34 +233,99 @@ function App() {
       setLoading(true);
       setError(null);
       
-      // Use new Node.js API endpoint
-      const apiUrl = 'https://nodejs-2-i1dr.onrender.com/api/voters/';
+      // Get endpoints to try (with failover)
+      const endpointsToTry = API_ENDPOINTS.length > 1 
+        ? [getNextEndpoint(), ...API_ENDPOINTS.filter(url => url !== getNextEndpoint())]
+        : API_ENDPOINTS;
       
-      const response = await axios.get(apiUrl, {
-        timeout: 25000, // Reduced to 25 seconds for faster timeout
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json'
-        },
-        withCredentials: false,
-        validateStatus: function (status) {
-          return status >= 200 && status < 500;
+      let lastError = null;
+      let response = null;
+      let successfulUrl = null;
+      
+      // Try each endpoint until one succeeds
+      for (let i = 0; i < endpointsToTry.length; i++) {
+        const apiUrl = endpointsToTry[i];
+        const startTime = Date.now();
+        
+        try {
+          response = await axios.get(apiUrl, {
+            timeout: 20000, // 20 seconds timeout per endpoint
+            headers: {
+              'Accept': 'application/json',
+              'Content-Type': 'application/json'
+            },
+            withCredentials: false,
+            validateStatus: function (status) {
+              return status >= 200 && status < 500;
+            }
+          });
+          
+          const responseTime = Date.now() - startTime;
+          
+          // Check if response is HTML (error page)
+          if (typeof response.data === 'string' && (response.data.includes('<!DOCTYPE') || response.data.includes('<html'))) {
+            updateEndpointHealth(apiUrl, false, responseTime);
+            lastError = new Error('API HTML error response मिळाला');
+            continue; // Try next endpoint
+          }
+          
+          // Try to parse JSON if it's a string
+          let result = response.data;
+          if (typeof response.data === 'string') {
+            try {
+              result = JSON.parse(response.data);
+            } catch (e) {
+              updateEndpointHealth(apiUrl, false, responseTime);
+              lastError = new Error('API ने invalid JSON return किया');
+              continue; // Try next endpoint
+            }
+          }
+          
+          // Check if we got valid data
+          const dataArray = (result && result.success && result.data && Array.isArray(result.data)) 
+            ? result.data 
+            : (result && Array.isArray(result)) 
+              ? result 
+              : null;
+          
+          if (!dataArray || dataArray.length === 0) {
+            updateEndpointHealth(apiUrl, false, responseTime);
+            lastError = new Error('API ने empty data return किया');
+            continue; // Try next endpoint
+          }
+          
+          // Success! Update health and break
+          updateEndpointHealth(apiUrl, true, responseTime);
+          successfulUrl = apiUrl;
+          break;
+          
+        } catch (err) {
+          const responseTime = Date.now() - startTime;
+          updateEndpointHealth(apiUrl, false, responseTime);
+          lastError = err;
+          
+          // If this is the last endpoint, throw error
+          if (i === endpointsToTry.length - 1) {
+            throw err;
+          }
+          // Otherwise, continue to next endpoint
+          continue;
         }
-      });
-      
-      // Check if response is HTML (error page)
-      if (typeof response.data === 'string' && (response.data.includes('<!DOCTYPE') || response.data.includes('<html'))) {
-        setError('API HTML error response मिळाला। कृपया API endpoint verify करें।');
-        return;
       }
       
-      // Try to parse JSON if it's a string
+      // If no endpoint succeeded, throw last error
+      if (!response || !successfulUrl) {
+        throw lastError || new Error('All API endpoints failed');
+      }
+      
+      // Process successful response
       let result = response.data;
       if (typeof response.data === 'string') {
         try {
           result = JSON.parse(response.data);
         } catch (e) {
           setError('API ने invalid JSON return किया। कृपया API endpoint check करें।');
+          setLoading(false);
           return;
         }
       }
@@ -208,27 +377,41 @@ function App() {
       }
     } catch (err) {
       if (err.code === 'ECONNABORTED') {
-        setError('विनंती टाइमआउट! कृपया नंतर पुन्हा प्रयत्न करा।');
+        setError('विनंती टाइमआउट! सभी endpoints fail हो गए। कृपया नंतर पुन्हा प्रयत्न करा।');
       } else if (err.response) {
         const status = err.response.status;
         const statusText = err.response.statusText || 'Unknown Error';
         const errorData = err.response.data;
         
         if (typeof errorData === 'string' && (errorData.includes('<!DOCTYPE') || errorData.includes('<html'))) {
-          setError(`सर्व्हर त्रुटी (${status}): API HTML error page return कर रहा है। कृपया API endpoint verify करें।`);
+          setError(`सर्व्हर त्रुटी (${status}): सभी API endpoints fail हो गए। कृपया बाद में retry करें।`);
         } else {
-          setError(`सर्व्हर त्रुटी: ${status} ${statusText}। कृपया नंतर पुन्हा प्रयत्न करा।`);
+          setError(`सर्व्हर त्रुटी: ${status} ${statusText}। सभी endpoints fail हो गए। कृपया नंतर पुन्हा प्रयत्न करा।`);
         }
       } else if (err.request) {
-        setError('नेटवर्क त्रुटी: सर्व्हरशी कनेक्ट होऊ शकले नाही। कृपया इंटरनेट कनेक्शन तपासा।');
+        setError('नेटवर्क त्रुटी: सभी API endpoints से connect नहीं हो पाया। कृपया इंटरनेट कनेक्शन तपासा।');
       } else {
-        setError(`त्रुटी: ${err.message || 'डेटा लोड करण्यात समस्या आली।'}`);
+        setError(`त्रुटी: ${err.message || 'सभी API endpoints fail हो गए। कृपया बाद में retry करें।'}`);
       }
       setLoading(false);
     } finally {
       isFetchingRef.current = false;
     }
   }, []); // Empty dependency array - fetchVoterData is stable
+
+  // Periodic health check for endpoints (runs every 5 minutes)
+  useEffect(() => {
+    const healthCheckInterval = setInterval(() => {
+      API_ENDPOINTS.forEach(url => {
+        const health = endpointHealthMap.get(url);
+        if (health && (Date.now() - health.lastChecked) > HEALTH_CHECK_INTERVAL) {
+          checkEndpointHealth(url);
+        }
+      });
+    }, HEALTH_CHECK_INTERVAL);
+    
+    return () => clearInterval(healthCheckInterval);
+  }, []);
 
   // Load data on mount
   useEffect(() => {
