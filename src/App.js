@@ -2,9 +2,9 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import axios from 'axios';
 import './App.css';
 import { 
-  FaSearch, FaTimes, FaUser, FaUserAlt, FaChartBar, FaSync, 
+  FaSearch, FaTimes, FaChartBar, FaSync, 
   FaWhatsapp, FaCheck, FaEdit, FaCopy, FaEye, FaSpinner,
-  FaHome, FaIdCard, FaMobileAlt, FaBirthdayCake, FaTag, 
+  FaMobileAlt, 
   FaMale, FaFemale, FaVoteYea, FaArrowLeft, FaArrowRight
 } from 'react-icons/fa';
 
@@ -279,7 +279,8 @@ function App() {
   useEffect(() => {
     console.log('🚀 App mounted, fetching voter data...');
     fetchVoterData();
-  }, []); // Only run once on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only run once on mount - fetchVoterData is stable with empty deps
 
   // Reset to page 1 when search query changes
   useEffect(() => {
