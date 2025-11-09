@@ -221,7 +221,45 @@ function App() {
 
   // No localStorage - data comes directly from database
 
-  // Fetch voter data - Optimized with Load Balancing
+  // Helper function to process voter data
+  const processVoterData = useCallback((dataArray) => {
+    if (!dataArray || !Array.isArray(dataArray)) {
+      return [];
+    }
+    
+    const validVoters = [];
+    const len = dataArray.length;
+    
+    for (let i = 0; i < len; i++) {
+      const voter = dataArray[i];
+      
+      // Quick validation check
+      if (!voter) continue;
+      const hasName = voter.name || voter.name_mr || voter['नाव (इंग्रजी)'] || voter['नाव (मराठी)'];
+      if (!hasName || (!voter.name?.trim() && !voter.name_mr?.trim() && !voter['नाव (इंग्रजी)']?.trim() && !voter['नाव (मराठी)']?.trim())) {
+        continue;
+      }
+      
+      // Map fields efficiently
+      validVoters.push({
+        'अनु क्र.': voter.serialNumber || voter['अनु क्र.'] || '',
+        'घर क्र.': voter.houseNumber || voter['घर क्र.'] || '',
+        'नाव (इंग्रजी)': voter.name || voter['नाव (इंग्रजी)'] || '',
+        'नाव (मराठी)': voter.name_mr || voter['नाव (मराठी)'] || '',
+        'लिंग (इंग्रजी)': voter.gender || voter['लिंग (इंग्रजी)'] || '',
+        'लिंग (मराठी)': voter.gender_mr || voter['लिंग (मराठी)'] || '',
+        'वय': String(voter.age || voter['वय'] || ''),
+        'मतदान कार्ड क्र.': voter.voterIdCard || voter['मतदान कार्ड क्र.'] || '',
+        'मोबाईल नं.': voter.mobileNumber || voter['मोबाईल नं.'] || '',
+        id: voter._id || voter.id || i + 1,
+        _originalId: voter._id || voter.id
+      });
+    }
+    
+    return validVoters;
+  }, []);
+
+  // Fetch voter data - Optimized with Load Balancing and Pagination
   const fetchVoterData = useCallback(async () => {
     // Prevent multiple simultaneous calls
     if (isFetchingRef.current) {
@@ -241,6 +279,8 @@ function App() {
       let lastError = null;
       let response = null;
       let successfulUrl = null;
+      let totalPages = 1;
+      let allVoters = [];
       
       // Try each endpoint until one succeeds
       for (let i = 0; i < endpointsToTry.length; i++) {
@@ -248,8 +288,123 @@ function App() {
         const startTime = Date.now();
         
         try {
+          // Strategy: Try pagination first (faster), fallback to full load (simpler)
+          // Step 1: Check if API supports pagination with a test request
+          let usePagination = false;
+          let totalCount = 0;
+          let limit = 2000; // Use larger page size for fewer requests
+          
+          try {
+            const testResponse = await axios.get(`${apiUrl}?page=1&limit=10`, {
+              timeout: 30000, // 30 seconds for test request
+              headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+              },
+              withCredentials: false,
+              validateStatus: function (status) {
+                return status >= 200 && status < 500;
+              }
+            });
+            
+            let testResult = testResponse.data;
+            if (typeof testResponse.data === 'string') {
+              try {
+                testResult = JSON.parse(testResponse.data);
+              } catch (e) {
+                // If parsing fails, skip pagination
+              }
+            }
+            
+            // Check if API supports pagination
+            if (testResult && testResult.success && testResult.totalCount && testResult.totalPages) {
+              usePagination = true;
+              totalCount = testResult.totalCount;
+              totalPages = Math.ceil(totalCount / limit);
+              successfulUrl = apiUrl;
+              console.log(`API supports pagination. Loading ${totalCount} records in ${totalPages} pages (${limit} per page)...`);
+            }
+          } catch (testErr) {
+            // If test fails, fall back to loading all data
+            console.log('Pagination test failed, will try loading all data at once');
+          }
+          
+          // Strategy 1: Use pagination if available
+          if (usePagination && totalPages > 0) {
+            const batchSize = 5; // Load 5 pages in parallel at a time
+            
+            for (let page = 1; page <= totalPages; page += batchSize) {
+              const pagesToLoad = [];
+              for (let p = page; p < Math.min(page + batchSize, totalPages + 1); p++) {
+                pagesToLoad.push(p);
+              }
+              
+              // Load pages in parallel
+              const pagePromises = pagesToLoad.map(pageNum => 
+                axios.get(`${apiUrl}?page=${pageNum}&limit=${limit}`, {
+                  timeout: 90000, // 90 seconds timeout per page
+                  headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                  },
+                  withCredentials: false,
+                  validateStatus: function (status) {
+                    return status >= 200 && status < 500;
+                  }
+                }).catch(err => {
+                  console.error(`Error loading page ${pageNum}:`, err.message);
+                  return null;
+                })
+              );
+              
+              const pageResponses = await Promise.all(pagePromises);
+              
+              // Process each page response
+              for (const pageResponse of pageResponses) {
+                if (!pageResponse || !pageResponse.data) continue;
+                
+                let pageResult = pageResponse.data;
+                if (typeof pageResponse.data === 'string') {
+                  try {
+                    pageResult = JSON.parse(pageResponse.data);
+                  } catch (e) {
+                    continue;
+                  }
+                }
+                
+                const pageData = (pageResult && pageResult.success && pageResult.data && Array.isArray(pageResult.data)) 
+                  ? pageResult.data 
+                  : (pageResult && Array.isArray(pageResult)) 
+                    ? pageResult 
+                    : [];
+                
+                if (pageData.length > 0) {
+                  allVoters = allVoters.concat(pageData);
+                }
+              }
+              
+              // Update UI periodically (every 3 batches or at the end)
+              const batchNumber = Math.floor((page - 1) / batchSize) + 1;
+              if (batchNumber % 3 === 0 || page + batchSize > totalPages) {
+                const processedVoters = processVoterData(allVoters);
+                setVoters(processedVoters);
+                console.log(`Progress: Loaded ${allVoters.length}/${totalCount} records...`);
+              }
+            }
+            
+            // Final processing and update
+            const processedVoters = processVoterData(allVoters);
+            setVoters(processedVoters);
+            setLoading(false);
+            updateEndpointHealth(apiUrl, true, Date.now() - startTime);
+            console.log(`Successfully loaded ${processedVoters.length} voters`);
+            return;
+          }
+          
+          // Strategy 2: Fallback - Load all data at once (simpler but slower)
+          console.log('Loading all data at once (this may take 1-2 minutes)...');
           response = await axios.get(apiUrl, {
-            timeout: 20000, // 20 seconds timeout per endpoint
+            timeout: 180000, // 180 seconds (3 minutes) timeout for full dataset
             headers: {
               'Accept': 'application/json',
               'Content-Type': 'application/json'
@@ -330,45 +485,15 @@ function App() {
         }
       }
       
-      // Optimized data processing - single pass for better performance
-      let validVoters = [];
+      // Process data using helper function
       const dataArray = (result && result.success && result.data && Array.isArray(result.data)) 
         ? result.data 
         : (result && Array.isArray(result)) 
           ? result 
           : null;
       
-      if (dataArray) {
-        // Single optimized pass - filter and map together for better performance
-        validVoters = [];
-        const len = dataArray.length;
-        
-        for (let i = 0; i < len; i++) {
-          const voter = dataArray[i];
-          
-          // Quick validation check
-          if (!voter) continue;
-          const hasName = voter.name || voter.name_mr || voter['नाव (इंग्रजी)'] || voter['नाव (मराठी)'];
-          if (!hasName || (!voter.name?.trim() && !voter.name_mr?.trim() && !voter['नाव (इंग्रजी)']?.trim() && !voter['नाव (मराठी)']?.trim())) {
-            continue;
-          }
-          
-          // Map fields efficiently
-          validVoters.push({
-            'अनु क्र.': voter.serialNumber || voter['अनु क्र.'] || '',
-            'घर क्र.': voter.houseNumber || voter['घर क्र.'] || '',
-            'नाव (इंग्रजी)': voter.name || voter['नाव (इंग्रजी)'] || '',
-            'नाव (मराठी)': voter.name_mr || voter['नाव (मराठी)'] || '',
-            'लिंग (इंग्रजी)': voter.gender || voter['लिंग (इंग्रजी)'] || '',
-            'लिंग (मराठी)': voter.gender_mr || voter['लिंग (मराठी)'] || '',
-            'वय': String(voter.age || voter['वय'] || ''),
-            'मतदान कार्ड क्र.': voter.voterIdCard || voter['मतदान कार्ड क्र.'] || '',
-            'मोबाईल नं.': voter.mobileNumber || voter['मोबाईल नं.'] || '',
-            id: voter._id || voter.id || i + 1,
-            _originalId: voter._id || voter.id
-          });
-        }
-        
+      if (dataArray && dataArray.length > 0) {
+        const validVoters = processVoterData(dataArray);
         setVoters(validVoters);
         setLoading(false);
       } else {
@@ -397,7 +522,7 @@ function App() {
     } finally {
       isFetchingRef.current = false;
     }
-  }, []); // Empty dependency array - fetchVoterData is stable
+  }, [processVoterData]); // Include processVoterData in dependencies
 
   // Periodic health check for endpoints (runs every 5 minutes)
   useEffect(() => {
