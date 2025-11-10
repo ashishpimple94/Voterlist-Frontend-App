@@ -925,7 +925,7 @@ function App() {
       });
       return false;
     }
-  }, [sendWhatsAppMessageCore]);
+  }, [sendWhatsAppMessageCore, sendWhatsAppLocation]);
 
   // Auto-send WhatsApp messages when search results are displayed
   useEffect(() => {
@@ -1724,7 +1724,7 @@ function App() {
     } finally {
       setSendingWhatsApp(false);
     }
-  }, [sendWhatsAppMessageCore]);
+  }, [sendWhatsAppMessageCore, sendWhatsAppLocation]);
 
   // Share voter details on WhatsApp - show input modal
   const shareOnWhatsApp = useCallback((voter) => {
