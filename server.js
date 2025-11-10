@@ -15,19 +15,21 @@ app.use(express.json());
 // WhatsApp API proxy endpoint
 app.post('/api/whatsapp-send', async (req, res) => {
   try {
-    const { phone_number, message, phone_number_id, api_key } = req.body;
+    const { phone_number, message, message_type, location, phone_number_id, api_key } = req.body;
 
     console.log('📤 WhatsApp API Request:', {
       phone_number,
       phone_number_id,
-      message_preview: message?.substring(0, 50) + '...'
+      message_type: message_type || 'text',
+      message_preview: message?.substring(0, 50) + '...',
+      has_location: !!location
     });
 
     // Validate input
-    if (!phone_number || !message || !phone_number_id || !api_key) {
+    if (!phone_number || !phone_number_id || !api_key) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: phone_number, message, phone_number_id, api_key'
+        error: 'Missing required fields: phone_number, phone_number_id, api_key'
       });
     }
 
@@ -35,16 +37,50 @@ app.post('/api/whatsapp-send', async (req, res) => {
     // Format: https://waba.xtendonline.com/v3/{phone_number_id}/messages
     const whatsappApiUrl = `https://waba.xtendonline.com/v3/${phone_number_id}/messages`;
 
-    // Prepare payload for WhatsApp API (Official Format)
-    // Format matches: { to, type, text: { body }, messaging_product }
-    const payload = {
-      messaging_product: 'whatsapp',
-      to: phone_number, // Format: 919090385555 (with country code 91)
-      type: 'text',
-      text: {
-        body: message
+    let payload;
+
+    // Check if it's a location message
+    if (message_type === 'location' && location) {
+      // Validate location fields
+      if (!location.latitude || !location.longitude || !location.name || !location.address) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing required location fields: latitude, longitude, name, address'
+        });
       }
-    };
+
+      // Prepare payload for location message
+      payload = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: phone_number,
+        type: 'location',
+        location: {
+          latitude: location.latitude,
+          longitude: location.longitude,
+          name: location.name,
+          address: location.address
+        }
+      };
+    } else {
+      // Text message - validate message field
+      if (!message) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing required field: message'
+        });
+      }
+
+      // Prepare payload for text message
+      payload = {
+        messaging_product: 'whatsapp',
+        to: phone_number, // Format: 919090385555 (with country code 91)
+        type: 'text',
+        text: {
+          body: message
+        }
+      };
+    }
 
     console.log('📡 Calling WhatsApp API:', whatsappApiUrl);
     console.log('📤 Payload:', JSON.stringify(payload, null, 2));

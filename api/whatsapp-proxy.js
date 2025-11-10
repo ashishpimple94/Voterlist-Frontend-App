@@ -20,25 +20,61 @@ app.use((req, res, next) => {
 
 app.post('/api/whatsapp-send', async (req, res) => {
   try {
-    const { phone_number, message, phone_number_id, api_key } = req.body;
+    const { phone_number, message, message_type, location, phone_number_id, api_key } = req.body;
 
-    if (!phone_number || !message || !phone_number_id || !api_key) {
+    if (!phone_number || !phone_number_id || !api_key) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields'
+        error: 'Missing required fields: phone_number, phone_number_id, api_key'
       });
     }
 
     const whatsappApiUrl = `https://waba.xtendonline.com/v3/${phone_number_id}/messages`;
     
-    const payload = {
-      messaging_product: 'whatsapp',
-      to: phone_number,
-      type: 'text',
-      text: {
-        body: message
+    let payload;
+
+    // Check if it's a location message
+    if (message_type === 'location' && location) {
+      // Validate location fields
+      if (!location.latitude || !location.longitude || !location.name || !location.address) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing required location fields: latitude, longitude, name, address'
+        });
       }
-    };
+
+      // Prepare payload for location message
+      payload = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: phone_number,
+        type: 'location',
+        location: {
+          latitude: location.latitude,
+          longitude: location.longitude,
+          name: location.name,
+          address: location.address
+        }
+      };
+    } else {
+      // Text message - validate message field
+      if (!message) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing required field: message'
+        });
+      }
+
+      // Prepare payload for text message
+      payload = {
+        messaging_product: 'whatsapp',
+        to: phone_number,
+        type: 'text',
+        text: {
+          body: message
+        }
+      };
+    }
 
     const response = await axios.post(whatsappApiUrl, payload, {
       headers: {

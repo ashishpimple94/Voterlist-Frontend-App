@@ -715,6 +715,95 @@ function App() {
     throw lastError || new Error('Failed to send WhatsApp message - all endpoints failed');
   }, [getWhatsAppApiUrl]);
 
+  // Function to send location message via WhatsApp
+  const sendWhatsAppLocation = useCallback(async (phoneNumber, latitude, longitude, name, address, phoneNumberId, apiKey) => {
+    const endpoints = getWhatsAppApiUrl();
+    let lastError = null;
+    
+    for (let endpointIndex = 0; endpointIndex < endpoints.length; endpointIndex++) {
+      const proxyApiUrl = endpoints[endpointIndex];
+      
+      try {
+        console.log(`📍 Sending location via WhatsApp (${endpointIndex + 1}/${endpoints.length}): ${proxyApiUrl}`);
+        
+        const payload = {
+          phone_number: phoneNumber,
+          message_type: 'location',
+          location: {
+            latitude: latitude,
+            longitude: longitude,
+            name: name,
+            address: address
+          },
+          phone_number_id: phoneNumberId,
+          api_key: apiKey
+        };
+        
+        const response = await axios.post(proxyApiUrl, payload, {
+          timeout: 30000,
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          withCredentials: false,
+          validateStatus: function (status) {
+            return status >= 200 && status < 500;
+          }
+        });
+        
+        let result;
+        if (typeof response.data === 'string') {
+          try {
+            result = JSON.parse(response.data);
+          } catch (e) {
+            console.error('❌ Failed to parse JSON:', response.data.substring(0, 200));
+            lastError = new Error('Invalid JSON response from proxy');
+            continue;
+          }
+        } else {
+          result = response.data;
+        }
+        
+        if (result && result.error) {
+          const errorMsg = result.error.message || JSON.stringify(result.error);
+          console.error('❌ WhatsApp Location API Error:', errorMsg);
+          lastError = new Error(errorMsg);
+          continue;
+        }
+        
+        if (result && result.success === true) {
+          const messageId = result.message_id || result.data?.messages?.[0]?.id || null;
+          console.log(`✅ Location sent successfully! Message ID: ${messageId}`);
+          return { success: true, messageId, data: result };
+        }
+        
+        if (result && result.messages && result.messages[0]?.id) {
+          const messageId = result.messages[0].id;
+          console.log(`✅ Location sent successfully! Message ID: ${messageId}`);
+          return { success: true, messageId, data: result };
+        }
+        
+        console.warn('⚠️ Unexpected location response format:', result);
+        lastError = new Error('Unexpected response format');
+        
+      } catch (err) {
+        console.error(`❌ Error sending location on endpoint ${endpointIndex + 1}:`, err.message);
+        lastError = err;
+        
+        if (err.code === 'ECONNREFUSED' || err.code === 'ERR_CONNECTION_REFUSED' || err.code === 'ERR_NETWORK') {
+          continue;
+        }
+        
+        if (err.response && (err.response.status === 404 || 
+            (typeof err.response.data === 'string' && err.response.data.includes('<html')))) {
+          continue;
+        }
+      }
+    }
+    
+    throw lastError || new Error('Failed to send location - all endpoints failed');
+  }, [getWhatsAppApiUrl]);
+
   const sendWhatsAppMessageAuto = useCallback(async (voter, targetNumber) => {
     try {
       // Clean and validate number
@@ -740,28 +829,54 @@ function App() {
       // Always add country code 91 (format: 919090385555)
       cleanNumber = '91' + cleanNumber;
       
+      // Helper function to remove duplicate words from name
+      const removeDuplicateWords = (name) => {
+        if (!name || !name.trim()) return name;
+        const words = name.trim().split(/\s+/);
+        const uniqueWords = [];
+        const seen = new Set();
+        for (const word of words) {
+          const wordLower = word.toLowerCase();
+          if (!seen.has(wordLower)) {
+            seen.add(wordLower);
+            uniqueWords.push(word);
+          }
+        }
+        return uniqueWords.join(' ');
+      };
+      
       // Prepare voter details for API
+      const rawNameMarathi = (voter['नाव (मराठी)'] && voter['नाव (मराठी)'].toString().trim()) || '';
+      const rawNameEnglish = (voter['नाव (इंग्रजी)'] && voter['नाव (इंग्रजी)'].toString().trim()) || '';
+      
       const voterDetails = {
         serial_no: (voter['अनु क्र.'] && voter['अनु क्र.'].toString().trim()) || '',
         house_no: (voter['घर क्र.'] && voter['घर क्र.'].toString().trim()) || '',
-        name_marathi: (voter['नाव (मराठी)'] && voter['नाव (मराठी)'].toString().trim()) || '',
-        name_english: (voter['नाव (इंग्रजी)'] && voter['नाव (इंग्रजी)'].toString().trim()) || '',
+        name_marathi: removeDuplicateWords(rawNameMarathi),
+        name_english: removeDuplicateWords(rawNameEnglish),
         gender: (voter['लिंग (मराठी)'] && voter['लिंग (मराठी)'].toString().trim()) || (voter['लिंग (इंग्रजी)'] && voter['लिंग (इंग्रजी)'].toString().trim()) || '',
         age: (voter['वय'] && voter['वय'].toString().trim()) || '',
-        epic_id: (voter['मतदान कार्ड क्र.'] && voter['मतदान कार्ड क्र.'].toString().trim()) || '',
-        mobile: (voter['मोबाईल नं.'] && voter['मोबाईल नं.'].toString().trim()) || ''
+        epic_id: (voter['मतदान कार्ड क्र.'] && voter['मतदान कार्ड क्र.'].toString().trim()) || ''
       };
+      
+      // Location details
+      const locationAddress = "Mayur Market Lane, Shambhu Vihar Society, Aundh, Pune, Maharashtra 411067";
+      const locationName = "Nana Walke Foundation";
+      const locationLatitude = "18.563531109117765";
+      const locationLongitude = "73.80246607790444";
+      const googleMapsLink = `https://www.google.com/maps?q=${locationLatitude},${locationLongitude}`;
       
       // Format message from voter details
       const message = `📋 *मतदार माहिती*\n\n` +
         `🏷️ *अनु क्र.:* ${voterDetails.serial_no || '-'}\n` +
-        `🏠 *घर क्र.:* ${voterDetails.house_no || '-'}\n` +
+        `📍 *स्थान:* ${voterDetails.house_no || '-'}\n` +
         `👤 *नाव (मराठी):* ${voterDetails.name_marathi || '-'}\n` +
         `👤 *नाव (इंग्रजी):* ${voterDetails.name_english || '-'}\n` +
         `⚧️ *लिंग:* ${voterDetails.gender || '-'}\n` +
         `🎂 *वय:* ${voterDetails.age || '-'}\n` +
-        `🆔 *मतदान कार्ड क्र.:* ${voterDetails.epic_id || '-'}\n` +
-        `📱 *मोबाइल नं.:* ${voterDetails.mobile || '-'}\n\n` +
+        `🆔 *मतदान कार्ड क्र.:* ${voterDetails.epic_id || '-'}\n\n` +
+        `🗺️ *Google Maps:*\n${googleMapsLink}\n\n` +
+        `📍 *Foundation Location:*\n${locationAddress}\n\n` +
         `Nana Walke Foundation`;
       
       // WhatsApp API Configuration - Use environment variables
@@ -775,6 +890,27 @@ function App() {
       
       if (result.success) {
         console.log(`✅ Successfully sent to ${voterDetails.name_english || voterDetails.name_marathi}`);
+        
+        // Send location message after text message
+        try {
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+          const locationResult = await sendWhatsAppLocation(
+            cleanNumber,
+            locationLatitude,
+            locationLongitude,
+            locationName,
+            locationAddress,
+            phoneNumberId,
+            apiKey
+          );
+          if (locationResult.success) {
+            console.log(`✅ Location sent successfully`);
+          }
+        } catch (locationError) {
+          console.error('❌ Failed to send location:', locationError.message);
+          // Don't fail the whole operation if location fails
+        }
+        
         return true;
       }
       
@@ -1374,28 +1510,54 @@ function App() {
       // Always add country code 91 (format: 919090385555)
       cleanNumber = '91' + cleanNumber;
       
+      // Helper function to remove duplicate words from name
+      const removeDuplicateWords = (name) => {
+        if (!name || !name.trim()) return name;
+        const words = name.trim().split(/\s+/);
+        const uniqueWords = [];
+        const seen = new Set();
+        for (const word of words) {
+          const wordLower = word.toLowerCase();
+          if (!seen.has(wordLower)) {
+            seen.add(wordLower);
+            uniqueWords.push(word);
+          }
+        }
+        return uniqueWords.join(' ');
+      };
+      
       // Prepare voter details for API - extract all data properly
+      const rawNameMarathi = (voter['नाव (मराठी)'] && voter['नाव (मराठी)'].toString().trim()) || '';
+      const rawNameEnglish = (voter['नाव (इंग्रजी)'] && voter['नाव (इंग्रजी)'].toString().trim()) || '';
+      
       const voterDetails = {
         serial_no: (voter['अनु क्र.'] && voter['अनु क्र.'].toString().trim()) || '',
         house_no: (voter['घर क्र.'] && voter['घर क्र.'].toString().trim()) || '',
-        name_marathi: (voter['नाव (मराठी)'] && voter['नाव (मराठी)'].toString().trim()) || '',
-        name_english: (voter['नाव (इंग्रजी)'] && voter['नाव (इंग्रजी)'].toString().trim()) || '',
+        name_marathi: removeDuplicateWords(rawNameMarathi),
+        name_english: removeDuplicateWords(rawNameEnglish),
         gender: (voter['लिंग (मराठी)'] && voter['लिंग (मराठी)'].toString().trim()) || (voter['लिंग (इंग्रजी)'] && voter['लिंग (इंग्रजी)'].toString().trim()) || '',
         age: (voter['वय'] && voter['वय'].toString().trim()) || '',
-        epic_id: (voter['मतदान कार्ड क्र.'] && voter['मतदान कार्ड क्र.'].toString().trim()) || '',
-        mobile: (voter['मोबाईल नं.'] && voter['मोबाईल नं.'].toString().trim()) || ''
+        epic_id: (voter['मतदान कार्ड क्र.'] && voter['मतदान कार्ड क्र.'].toString().trim()) || ''
       };
+      
+      // Location details
+      const locationAddress = "Mayur Market Lane, Shambhu Vihar Society, Aundh, Pune, Maharashtra 411067";
+      const locationName = "Nana Walke Foundation";
+      const locationLatitude = "18.563531109117765";
+      const locationLongitude = "73.80246607790444";
+      const googleMapsLink = `https://www.google.com/maps?q=${locationLatitude},${locationLongitude}`;
       
       // Format message from voter details (exactly as per user's example)
       const message = `📋 *मतदार माहिती*\n\n` +
         `🏷️ *अनु क्र.:* ${voterDetails.serial_no || '-'}\n` +
-        `🏠 *घर क्र.:* ${voterDetails.house_no || '-'}\n` +
+        `📍 *स्थान:* ${voterDetails.house_no || '-'}\n` +
         `👤 *नाव (मराठी):* ${voterDetails.name_marathi || '-'}\n` +
         `👤 *नाव (इंग्रजी):* ${voterDetails.name_english || '-'}\n` +
         `⚧️ *लिंग:* ${voterDetails.gender || '-'}\n` +
         `🎂 *वय:* ${voterDetails.age || '-'}\n` +
-        `🆔 *मतदान कार्ड क्र.:* ${voterDetails.epic_id || '-'}\n` +
-        `📱 *मोबाइल नं.:* ${voterDetails.mobile || '-'}\n\n` +
+        `🆔 *मतदान कार्ड क्र.:* ${voterDetails.epic_id || '-'}\n\n` +
+        `🗺️ *Google Maps:*\n${googleMapsLink}\n\n` +
+        `📍 *Foundation Location:*\n${locationAddress}\n\n` +
         `Nana Walke Foundation`;
       
       // WhatsApp API Configuration - Use environment variables
@@ -1420,6 +1582,26 @@ function App() {
         console.log('  - Sent to:', cleanNumber);
         console.log('  - WA ID:', waId || 'Not found');
         console.log('  - Contact registered on WhatsApp:', contactExists);
+        
+        // Send location message after text message
+        try {
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+          const locationResult = await sendWhatsAppLocation(
+            cleanNumber,
+            locationLatitude,
+            locationLongitude,
+            locationName,
+            locationAddress,
+            phoneNumberId,
+            apiKey
+          );
+          if (locationResult.success) {
+            console.log('✅ Location sent successfully!');
+          }
+        } catch (locationError) {
+          console.error('❌ Failed to send location:', locationError.message);
+          // Don't fail the whole operation if location fails
+        }
         
         let successMessage = '✅ WhatsApp message यशस्वीरित्या भेजला गेला!\n\n' + 
               `📱 Number: ${cleanNumber}\n` +
